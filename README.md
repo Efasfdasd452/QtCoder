@@ -115,6 +115,12 @@ python main.py
 ✅ 安全离线工具，不依赖在线网站
 
 ---
+## 打包为exe
+```
+pyinstaller -F -w --icon=QtCoder.ico --name QtCoder main.py
+```
+
+---
 
 ## 📈 TODO（未来计划）
 
