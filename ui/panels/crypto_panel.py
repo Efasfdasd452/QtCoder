@@ -10,7 +10,7 @@ from PyQt5.QtWidgets import (
 from .base_panel import BasePanel
 from core.crypto import (
     DISPLAY_NAMES, ALGO_KEY_MAP, CIPHER_MODES, CIPHER_KEY_SIZES,
-    do_encrypt, do_decrypt, HAS_CRYPTO, _rand
+    _8BYTE_BLOCK_ALGOS, do_encrypt, do_decrypt, HAS_CRYPTO, _rand
 )
 
 
@@ -124,7 +124,7 @@ class CryptoPanel(BasePanel):
     def _random_iv(self):
         algo = self._algo_name()
         mode = self._mode.currentText()
-        size = 12 if mode == 'GCM' else (8 if algo in ('DES', '3DES', 'Blowfish') else 16)
+        size = 12 if mode == 'GCM' else (8 if algo in _8BYTE_BLOCK_ALGOS else 16)
         self._iv.setText(_rand(size).hex())
 
     def process(self, text):

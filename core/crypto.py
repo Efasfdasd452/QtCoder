@@ -1,5 +1,12 @@
 # -*- coding: utf-8 -*-
-"""加密/解密引擎 — 纯函数，无 UI 依赖"""
+"""加密/解密引擎 — 纯函数，无 UI 依赖
+
+支持算法:
+    分组密码: AES, DES, 3DES, Blowfish, CAST5, RC2
+    流密码:   ChaCha20, Salsa20, RC4
+    AEAD:     AES-GCM, ChaCha20-Poly1305
+    其它:     XOR
+"""
 
 import os
 import base64
@@ -7,13 +14,19 @@ import hashlib
 
 HAS_CRYPTO = False
 try:
-    from Crypto.Cipher import AES, DES, DES3, Blowfish, ChaCha20, ARC4
+    from Crypto.Cipher import (
+        AES, DES, DES3, Blowfish, ChaCha20, ARC4,
+        CAST, Salsa20, ChaCha20_Poly1305, ARC2
+    )
     from Crypto.Util.Padding import pad, unpad
     from Crypto.Random import get_random_bytes
     HAS_CRYPTO = True
 except ImportError:
     try:
-        from Cryptodome.Cipher import AES, DES, DES3, Blowfish, ChaCha20, ARC4
+        from Cryptodome.Cipher import (
+            AES, DES, DES3, Blowfish, ChaCha20, ARC4,
+            CAST, Salsa20, ChaCha20_Poly1305, ARC2
+        )
         from Cryptodome.Util.Padding import pad, unpad
         from Cryptodome.Random import get_random_bytes
         HAS_CRYPTO = True
@@ -22,24 +35,48 @@ except ImportError:
 
 # ── 算法 → 可用模式 映射 ─────────────────────────────────────
 CIPHER_MODES = {
-    "AES":      ["ECB", "CBC", "CFB", "OFB", "CTR", "GCM"],
-    "DES":      ["ECB", "CBC"],
-    "3DES":     ["ECB", "CBC"],
-    "Blowfish": ["ECB", "CBC"],
-    "ChaCha20": [],
-    "RC4":      [],
-    "XOR":      [],
+    "AES":              ["ECB", "CBC", "CFB", "OFB", "CTR", "GCM"],
+    "DES":              ["ECB", "CBC", "CFB", "OFB"],
+    "3DES":             ["ECB", "CBC", "CFB", "OFB"],
+    "Blowfish":         ["ECB", "CBC", "CFB", "OFB"],
+    "CAST5":            ["ECB", "CBC", "CFB", "OFB"],
+    "RC2":              ["ECB", "CBC", "CFB", "OFB"],
+    "ChaCha20":         [],
+    "Salsa20":          [],
+    "ChaCha20-Poly1305": [],
+    "RC4":              [],
+    "XOR":              [],
 }
 
 CIPHER_KEY_SIZES = {
     'AES': 32, 'DES': 8, '3DES': 24, 'Blowfish': 16,
-    'ChaCha20': 32, 'RC4': 16, 'XOR': 16,
+    'CAST5': 16, 'RC2': 16,
+    'ChaCha20': 32, 'Salsa20': 32, 'ChaCha20-Poly1305': 32,
+    'RC4': 16, 'XOR': 16,
 }
 
+# 8 字节分组的算法（用于 IV 大小判断）
+_8BYTE_BLOCK_ALGOS = ('DES', '3DES', 'Blowfish', 'CAST5', 'RC2')
+
 # 显示名 → 内部算法名
-DISPLAY_NAMES = ["AES", "DES", "3DES (Triple DES)", "Blowfish",
-                 "ChaCha20", "RC4", "XOR"]
-ALGO_KEY_MAP = {"3DES (Triple DES)": "3DES"}
+DISPLAY_NAMES = [
+    "AES",
+    "DES",
+    "3DES (Triple DES)",
+    "Blowfish",
+    "CAST5 (CAST-128)",
+    "RC2 (ARC2)",
+    "ChaCha20",
+    "Salsa20",
+    "ChaCha20-Poly1305",
+    "RC4",
+    "XOR",
+]
+ALGO_KEY_MAP = {
+    "3DES (Triple DES)": "3DES",
+    "CAST5 (CAST-128)": "CAST5",
+    "RC2 (ARC2)": "RC2",
+}
 
 
 def _rand(n):
@@ -65,15 +102,34 @@ def prepare_key(key_text: str, key_format: str, algo: str) -> bytes:
             key_bytes = hashlib.sha256(key_bytes).digest()[:8]
     elif algo == '3DES':
         if len(key_bytes) < 24:
-            key_bytes = hashlib.sha256(key_bytes).digest()[:24]
+            # 用 SHA-256 扩展密钥，确保 3 段各不相同
+            h = hashlib.sha256(key_bytes).digest()
+            key_bytes = h[:24]
         else:
             key_bytes = key_bytes[:24]
+        # 防止 key1==key2==key3 退化为单 DES
+        if key_bytes[:8] == key_bytes[8:16] == key_bytes[16:24]:
+            h = hashlib.sha256(key_bytes).digest()
+            key_bytes = h[:24]
     elif algo == 'Blowfish':
         if len(key_bytes) < 4:
             key_bytes = key_bytes.ljust(4, b'\x00')
         elif len(key_bytes) > 56:
             key_bytes = hashlib.sha256(key_bytes).digest()
-    elif algo == 'ChaCha20':
+    elif algo == 'CAST5':
+        # CAST5: 5-16 字节密钥
+        if len(key_bytes) < 5:
+            key_bytes = key_bytes.ljust(5, b'\x00')
+        elif len(key_bytes) > 16:
+            key_bytes = hashlib.sha256(key_bytes).digest()[:16]
+    elif algo == 'RC2':
+        # RC2: 5-128 字节密钥，通常用 16 字节
+        if len(key_bytes) < 5:
+            key_bytes = key_bytes.ljust(5, b'\x00')
+        elif len(key_bytes) > 128:
+            key_bytes = hashlib.sha256(key_bytes).digest()
+    elif algo in ('ChaCha20', 'Salsa20', 'ChaCha20-Poly1305'):
+        # 这三个算法都要求 32 字节密钥
         if len(key_bytes) != 32:
             key_bytes = hashlib.sha256(key_bytes).digest()
     return key_bytes
@@ -160,9 +216,13 @@ def _block_decrypt(cm, raw, key, iv_text, kf, mode):
 _CIPHER_MAP = {}  # 延迟填充，避免未安装时 NameError
 
 def _get_cipher_mod(algo):
+    """返回分组密码模块（支持 ECB/CBC/CFB/OFB/CTR/GCM 的算法）"""
     global _CIPHER_MAP
     if not _CIPHER_MAP and HAS_CRYPTO:
-        _CIPHER_MAP = {'AES': AES, 'DES': DES, '3DES': DES3, 'Blowfish': Blowfish}
+        _CIPHER_MAP = {
+            'AES': AES, 'DES': DES, '3DES': DES3, 'Blowfish': Blowfish,
+            'CAST5': CAST, 'RC2': ARC2,
+        }
     return _CIPHER_MAP.get(algo)
 
 
@@ -173,20 +233,37 @@ def do_encrypt(algo, plaintext, key, iv, mode, key_fmt, out_fmt):
     data = plaintext.encode('utf-8')
     key_bytes = prepare_key(key, key_fmt, algo)
 
+    # 分组密码 (AES / DES / 3DES / Blowfish / CAST5 / RC2)
     cm = _get_cipher_mod(algo)
     if cm:
         return _block_encrypt(cm, data, key_bytes, iv, key_fmt, mode, out_fmt)
+
+    # ── 流密码 & AEAD ────────────────────────────────────────
     if algo == 'ChaCha20':
         cipher = ChaCha20.new(key=key_bytes)
         return format_bytes(cipher.nonce + cipher.encrypt(data), out_fmt)
+
+    if algo == 'Salsa20':
+        cipher = Salsa20.new(key=key_bytes)
+        return format_bytes(cipher.nonce + cipher.encrypt(data), out_fmt)
+
+    if algo == 'ChaCha20-Poly1305':
+        nonce = prepare_iv(iv, key_fmt, 12) if iv else _rand(12)
+        cipher = ChaCha20_Poly1305.new(key=key_bytes, nonce=nonce)
+        ciphertext, tag = cipher.encrypt_and_digest(data)
+        # nonce(12) + tag(16) + ciphertext
+        return format_bytes(nonce + tag + ciphertext, out_fmt)
+
     if algo == 'RC4':
         return format_bytes(ARC4.new(key_bytes).encrypt(data), out_fmt)
+
     if algo == 'XOR':
         xk = (bytes.fromhex(key.replace(' ', '')) if key_fmt == 'hex'
               else key.encode('utf-8'))
         if not xk:
             raise ValueError("XOR 密钥不能为空")
         return format_bytes(bytes(b ^ xk[i % len(xk)] for i, b in enumerate(data)), out_fmt)
+
     raise ValueError(f"不支持的算法: {algo}")
 
 
@@ -196,20 +273,37 @@ def do_decrypt(algo, ciphertext, key, iv, mode, key_fmt, in_fmt):
     raw = parse_bytes(ciphertext, in_fmt)
     key_bytes = prepare_key(key, key_fmt, algo)
 
+    # 分组密码
     cm = _get_cipher_mod(algo)
     if cm:
         return safe_bytes_to_str(_block_decrypt(cm, raw, key_bytes, iv, key_fmt, mode))
+
+    # ── 流密码 & AEAD ────────────────────────────────────────
     if algo == 'ChaCha20':
         cipher = ChaCha20.new(key=key_bytes, nonce=raw[:8])
         pt = cipher.decrypt(raw[8:])
+
+    elif algo == 'Salsa20':
+        cipher = Salsa20.new(key=key_bytes, nonce=raw[:8])
+        pt = cipher.decrypt(raw[8:])
+
+    elif algo == 'ChaCha20-Poly1305':
+        # nonce(12) + tag(16) + ciphertext
+        nonce, tag, enc = raw[:12], raw[12:28], raw[28:]
+        cipher = ChaCha20_Poly1305.new(key=key_bytes, nonce=nonce)
+        pt = cipher.decrypt_and_verify(enc, tag)
+
     elif algo == 'RC4':
         pt = ARC4.new(key_bytes).decrypt(raw)
+
     elif algo == 'XOR':
         xk = (bytes.fromhex(key.replace(' ', '')) if key_fmt == 'hex'
               else key.encode('utf-8'))
         if not xk:
             raise ValueError("XOR 密钥不能为空")
         pt = bytes(b ^ xk[i % len(xk)] for i, b in enumerate(raw))
+
     else:
         raise ValueError(f"不支持的算法: {algo}")
+
     return safe_bytes_to_str(pt)
