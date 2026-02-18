@@ -36,6 +36,8 @@ from .panels.proxy_panel     import ProxyTestPanel
 from .panels.html_panel      import HtmlPanel
 from .panels.openssl_panel   import OpensslPanel
 from .panels.identifier_panel import IdentifierPanel
+from .panels.watermark_panel  import WatermarkPanel
+from .panels.firewall_panel   import FirewallPanel
 
 # ── 功能注册表 ───────────────────────────────────────────────
 # (分类名, 分类色, [(显示名, 简介, Panel类), ...])
@@ -63,6 +65,10 @@ FEATURES = [
     ("网络工具", "#8764b8", [
         ("端口扫描",      "TCP 端口开放检测与服务协议自动识别",         PortScanPanel),
         ("代理测试",      "HTTP / SOCKS5 代理批量测试 URL 可达性",     ProxyTestPanel),
+        ("防火墙规则",    "iptables/ufw/firewalld/nftables/netsh 规则生成", FirewallPanel),
+    ]),
+    ("图像分析", "#e74856", [
+        ("水印检测",      "隐藏水印检测/嵌入/提取 (blind_watermark + 多维度分析)", WatermarkPanel),
     ]),
 ]
 

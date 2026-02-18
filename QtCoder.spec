@@ -154,6 +154,42 @@ hidden_imports = [
     'ui.panels.html_panel',
     'ui.panels.openssl_panel',
     'ui.panels.identifier_panel',
+    'ui.panels.watermark_panel',
+    'ui.panels.firewall_panel',
+
+    # ── 水印检测 ───────────────────────────────────────────
+    'core.watermark_detector',
+    'core.firewall_gen',
+
+    # ── blind_watermark ────────────────────────────────────
+    'blind_watermark',
+    'blind_watermark.blind_watermark',
+    'blind_watermark.bwm_core',
+    'blind_watermark.pool',
+    'blind_watermark.recover',
+    'blind_watermark.att',
+    'blind_watermark.version',
+    'blind_watermark.cli_tools',
+
+    # ── numpy ──────────────────────────────────────────────
+    'numpy',
+    'numpy.core',
+    'numpy.core._methods',
+    'numpy.lib',
+    'numpy.lib.format',
+    'numpy.fft',
+    'numpy.linalg',
+    'numpy.random',
+
+    # ── opencv ─────────────────────────────────────────────
+    'cv2',
+
+    # ── PyWavelets ─────────────────────────────────────────
+    'pywt',
+    'pywt._extensions',
+    'pywt._extensions._pywt',
+    'pywt._extensions._dwt',
+    'pywt._extensions._swt',
 ]
 
 # ── 数据文件 ──────────────────────────────────────────────────
@@ -173,11 +209,10 @@ except ImportError:
 # ── 排除不需要的模块（减小体积）────────────────────────────
 excludes = [
     'tkinter', '_tkinter',
-    'matplotlib', 'numpy', 'pandas', 'scipy',
-    'PIL', 'cv2',
+    'matplotlib', 'pandas', 'scipy',
     'unittest', 'test', 'tests',
-    'setuptools', 'pkg_resources',
-    'distutils',
+    # 注意: setuptools / distutils / pkg_resources 不能排除,
+    # PyInstaller 6.x + Python 3.12 的 hook-distutils 依赖 setuptools
     'xmlrpc', 'pydoc',
 ]
 
