@@ -3,3 +3,5 @@
 /.claude/
 /dist/
 /build/
+/ffmpeg/
+__pycache__/

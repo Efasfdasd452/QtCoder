@@ -38,6 +38,7 @@ from .panels.openssl_panel   import OpensslPanel
 from .panels.identifier_panel import IdentifierPanel
 from .panels.watermark_panel  import WatermarkPanel
 from .panels.firewall_panel   import FirewallPanel
+from .panels.video_panel      import VideoPanel
 
 # ── 功能注册表 ───────────────────────────────────────────────
 # (分类名, 分类色, [(显示名, 简介, Panel类), ...])
@@ -67,8 +68,9 @@ FEATURES = [
         ("代理测试",      "HTTP / SOCKS5 代理批量测试 URL 可达性",     ProxyTestPanel),
         ("防火墙规则",    "iptables/ufw/firewalld/nftables/netsh 规则生成", FirewallPanel),
     ]),
-    ("图像分析", "#e74856", [
+    ("媒体工具", "#e74856", [
         ("水印检测",      "隐藏水印检测/嵌入/提取 (blind_watermark + 多维度分析)", WatermarkPanel),
+        ("视频压缩",      "FFmpeg 视频压缩 · H.264/H.265/AV1 · 硬件加速", VideoPanel),
     ]),
 ]
 

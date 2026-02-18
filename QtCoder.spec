@@ -156,10 +156,13 @@ hidden_imports = [
     'ui.panels.identifier_panel',
     'ui.panels.watermark_panel',
     'ui.panels.firewall_panel',
+    'ui.panels.video_panel',
 
     # ── 水印检测 ───────────────────────────────────────────
     'core.watermark_detector',
     'core.firewall_gen',
+    'core.video_compress',
+    'core.ffmpeg_downloader',
 
     # ── blind_watermark ────────────────────────────────────
     'blind_watermark',
