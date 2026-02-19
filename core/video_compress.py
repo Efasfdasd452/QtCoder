@@ -223,6 +223,25 @@ def detect_hw_encoders() -> list:
     return [(c, n) for c, n in candidates if c in out]
 
 
+# ── 软件编码器 → 硬件编码器自动映射 ─────────────────────────
+
+_HW_ENCODER_MAP = {
+    "libx264": ["h264_nvenc", "h264_qsv", "h264_amf"],
+    "libx265": ["hevc_nvenc", "hevc_qsv", "hevc_amf"],
+}
+
+
+def auto_select_encoder(sw_codec: str, available_hw: list) -> str:
+    """若有可用硬件编码器则自动替换，优先级 NVENC > QSV > AMF。
+    available_hw: [(codec_name, display_name), ...]
+    """
+    hw_names = {c for c, _ in available_hw}
+    for candidate in _HW_ENCODER_MAP.get(sw_codec, []):
+        if candidate in hw_names:
+            return candidate
+    return sw_codec
+
+
 # ── 压缩配置与命令构建 ──────────────────────────────────────
 
 @dataclass
@@ -282,7 +301,7 @@ def build_command(cfg: CompressConfig) -> list:
                 "-qp_i", str(cfg.crf), "-qp_p", str(cfg.crf)]
 
     if cfg.target_width > 0:
-        cmd += ["-vf", f"scale={cfg.target_width}:-2:flags=lanczos"]
+        cmd += ["-vf", f"scale={cfg.target_width}:-2:flags=lanczos,setsar=1"]
 
     if cfg.audio_mode == "copy":
         cmd += ["-c:a", "copy"]

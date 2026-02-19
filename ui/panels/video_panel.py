@@ -28,7 +28,7 @@ from core.video_compress import (
     PRESETS, CODECS, SPEEDS, RESOLUTIONS, AUDIO_OPTS,
     CompressConfig, build_command, parse_progress,
     VIDEO_EXTS, VIDEO_FILTER, OUTPUT_FILTER,
-    detect_hw_encoders,
+    detect_hw_encoders, auto_select_encoder,
     collect_videos_from_folder,
     estimate_compressed_size,
     estimate_one_file_size,
@@ -85,6 +85,15 @@ class _DownloadWorker(QThread):
             self.finished.emit(True, path)
         except Exception as e:
             self.finished.emit(False, f"{type(e).__name__}: {e}")
+
+
+# ── 硬件编码器检测线程 ───────────────────────────────────────
+
+class _HwDetectWorker(QThread):
+    done = pyqtSignal(list)
+
+    def run(self):
+        self.done.emit(detect_hw_encoders())
 
 
 # ── 压缩工作线程 ─────────────────────────────────────────────
@@ -156,10 +165,11 @@ class _BatchCompressWorker(QThread):
     file_done = pyqtSignal(int, bool, str)   # index, success, message
     finished = pyqtSignal(bool, str)
 
-    def __init__(self, tasks):
+    def __init__(self, tasks, hw_encoders=None):
         super().__init__()
         # tasks: [(input_path, output_path, preset_key), ...]
         self._tasks = list(tasks)
+        self._hw_encoders = hw_encoders or []
         self._cancelled = False
         self._proc = None
 
@@ -181,6 +191,7 @@ class _BatchCompressWorker(QThread):
                 failed.append(os.path.basename(inp))
                 continue
             cfg = CompressConfig.from_preset(preset_key, inp, out)
+            cfg.vcodec = auto_select_encoder(cfg.vcodec, self._hw_encoders)
             try:
                 cmd = build_command(cfg)
             except Exception as e:
@@ -220,12 +231,22 @@ class _BatchCompressWorker(QThread):
             if self._cancelled:
                 if self._proc and self._proc.poll() is None:
                     self._proc.kill()
+                if out and os.path.isfile(out):
+                    try:
+                        os.remove(out)
+                    except OSError:
+                        pass
                 self.finished.emit(False, "已取消")
                 return
             if self._proc.returncode == 0:
                 self.progress.emit(i, total, 100.0)
                 self.file_done.emit(i, True, "完成")
             else:
+                if out and os.path.isfile(out):
+                    try:
+                        os.remove(out)
+                    except OSError:
+                        pass
                 self.file_done.emit(i, False, f"退出码 {self._proc.returncode}")
                 failed.append(os.path.basename(inp))
         if failed:
@@ -259,6 +280,7 @@ class VideoPanel(QWidget):
         self._multi_output_dir = ""   # 多选时的输出文件夹
         self._build_ui()
         self.setAcceptDrops(True)
+        self._detect_hw()
 
     # ── UI 搭建 ──────────────────────────────────────────────
 
@@ -357,12 +379,14 @@ class VideoPanel(QWidget):
             self._codec_combo.addItem(name, codec)
         self._codec_combo.setCurrentIndex(1)
         self._codec_combo.setMinimumWidth(220)
+        self._codec_combo.setFixedHeight(28)
         r1.addWidget(self._codec_combo)
         r1.addSpacing(16)
         r1.addWidget(QLabel("CRF:"))
         self._crf_spin = QSpinBox()
         self._crf_spin.setRange(0, 51)
         self._crf_spin.setValue(20)
+        self._crf_spin.setFixedHeight(28)
         self._crf_spin.setToolTip(
             "0 = 无损  18 = 视觉无损  23 = 高质量  28 = 中等\n"
             "越低画质越好、文件越大")
@@ -381,6 +405,7 @@ class VideoPanel(QWidget):
             self._speed_combo.addItem(name, speed)
         self._speed_combo.setCurrentIndex(5)
         self._speed_combo.setMinimumWidth(160)
+        self._speed_combo.setFixedHeight(28)
         r2.addWidget(self._speed_combo)
         r2.addSpacing(16)
         r2.addWidget(QLabel("分辨率:"))
@@ -388,6 +413,7 @@ class VideoPanel(QWidget):
         for w, h, name in RESOLUTIONS:
             self._res_combo.addItem(name, (w, h))
         self._res_combo.setMinimumWidth(180)
+        self._res_combo.setFixedHeight(28)
         r2.addWidget(self._res_combo)
         r2.addStretch()
         cl.addLayout(r2)
@@ -399,6 +425,7 @@ class VideoPanel(QWidget):
             self._audio_combo.addItem(name, mode)
         self._audio_combo.setCurrentIndex(2)
         self._audio_combo.setMinimumWidth(180)
+        self._audio_combo.setFixedHeight(28)
         r3.addWidget(self._audio_combo)
         r3.addStretch()
         cl.addLayout(r3)
@@ -499,7 +526,7 @@ class VideoPanel(QWidget):
         bl.addStretch()
         self._tabs.addTab(self._batch_tab_widget, "批量（文件夹）")
 
-        root.addWidget(self._tabs)
+        root.addWidget(self._tabs, stretch=1)
 
         # ── 操作行 ──
         act_row = QHBoxLayout()
@@ -581,6 +608,29 @@ class VideoPanel(QWidget):
             "就绪 — 支持 MP4 / MKV / AVI / M2TS / MOV / FLV / WebM 等格式")
         self._status.setStyleSheet("color:#666;font-size:11px;")
         root.addWidget(self._status)
+
+    # ── 硬件加速检测 ─────────────────────────────────────────
+
+    def _detect_hw(self):
+        if not find_ffmpeg():
+            return
+        self._hw_detect_worker = _HwDetectWorker()
+        self._hw_detect_worker.done.connect(self._on_hw_detected)
+        self._hw_detect_worker.start()
+
+    def _on_hw_detected(self, encoders):
+        self._hw_encoders = encoders
+        self._hw_detected = True
+        if not encoders:
+            return
+        names = ", ".join(n for _, n in encoders)
+        # 填充自定义模式的编码器下拉框
+        for codec, name in encoders:
+            if self._codec_combo.findData(codec) == -1:
+                self._codec_combo.addItem(f"{name} (硬件)", codec)
+        self._hw_label.setText(f"检测到硬件编码器: {names}")
+        self._status.setText(
+            f"GPU 硬件加速可用: {names}  —  使用预设时将自动启用")
 
     # ── Drag & Drop ──────────────────────────────────────────
 
@@ -767,15 +817,7 @@ class VideoPanel(QWidget):
         self._custom_widget.setVisible(is_custom)
 
         if is_custom:
-            if not self._hw_detected:
-                self._hw_detected = True
-                self._hw_encoders = detect_hw_encoders()
-                if self._hw_encoders:
-                    for codec, name in self._hw_encoders:
-                        self._codec_combo.addItem(f"{name} (硬件)", codec)
-                    names = ", ".join(n for _, n in self._hw_encoders)
-                    self._hw_label.setText(f"检测到硬件编码器: {names}")
-                    self._hw_label.setVisible(True)
+            self._hw_label.setVisible(bool(self._hw_encoders))
             self._preset_desc.setText("手动配置编码参数")
         else:
             for key, rb in self._preset_btns.items():
@@ -826,6 +868,7 @@ class VideoPanel(QWidget):
                     break
             cfg = CompressConfig.from_preset(
                 preset_key, self._info.path, self._output_path)
+            cfg.vcodec = auto_select_encoder(cfg.vcodec, self._hw_encoders)
 
         return cfg
 
@@ -942,6 +985,11 @@ class VideoPanel(QWidget):
             self._status.setText(
                 f"压缩完成 — {_fmt_size(out_size)} (节省 {pct:.1f}%)")
         else:
+            if self._output_path and os.path.isfile(self._output_path):
+                try:
+                    os.remove(self._output_path)
+                except OSError:
+                    pass
             self._result_frame.setStyleSheet(
                 "QFrame{background:#fff0f0;border:1px solid #d13438;"
                 "border-radius:6px;padding:8px;}")
@@ -1120,7 +1168,7 @@ class VideoPanel(QWidget):
         self._progress_label.setVisible(True)
         self._result_frame.setVisible(False)
         self._status.setText("批量压缩中…")
-        self._batch_worker = _BatchCompressWorker(tasks)
+        self._batch_worker = _BatchCompressWorker(tasks, hw_encoders=self._hw_encoders)
         self._batch_worker.progress.connect(self._on_batch_progress)
         self._batch_worker.log_line.connect(self._on_log)
         self._batch_worker.finished.connect(self._on_batch_finished)
@@ -1162,7 +1210,7 @@ class VideoPanel(QWidget):
         self._progress_label.setText("准备中…")
         self._result_frame.setVisible(False)
         self._status.setText("批量压缩中…")
-        self._batch_worker = _BatchCompressWorker(tasks)
+        self._batch_worker = _BatchCompressWorker(tasks, hw_encoders=self._hw_encoders)
         self._batch_worker.progress.connect(self._on_batch_progress)
         self._batch_worker.log_line.connect(self._on_log)
         self._batch_worker.finished.connect(self._on_batch_finished)
