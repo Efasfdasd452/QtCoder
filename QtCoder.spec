@@ -1,17 +1,36 @@
 # -*- mode: python ; coding: utf-8 -*-
-# QtCoder - PyInstaller 打包配置
+# QtCoder - PyInstaller 打包配置 (文件夹模式)
 #
 # 用法:
 #   .venv/Scripts/pyinstaller QtCoder.spec --noconfirm
-#   或直接运行 build.bat
+#   或运行 python build.py
 
 import os
 import sys
+import platform
 
 block_cipher = None
 
 # ── 项目根目录 ────────────────────────────────────────────────
 PROJECT_DIR = os.path.abspath(SPECPATH)
+
+# ── 平台判断与 FFmpeg 路径 ────────────────────────────────────
+IS_WIN = os.name == 'nt'
+if IS_WIN:
+    _ffmpeg_src = os.path.join(PROJECT_DIR, 'vendor', 'ffmpeg', 'bin')
+else:
+    _ffmpeg_src = os.path.join(PROJECT_DIR, 'linux_ffmpeg', 'ffmpeg', 'bin')
+
+# 收集 FFmpeg 二进制文件 → 打包后放在 ffmpeg/ 目录下
+_ffmpeg_binaries = []
+if os.path.isdir(_ffmpeg_src):
+    for f in os.listdir(_ffmpeg_src):
+        fp = os.path.join(_ffmpeg_src, f)
+        if os.path.isfile(fp):
+            _ffmpeg_binaries.append((fp, 'ffmpeg'))
+else:
+    print(f"[WARN] FFmpeg 目录不存在: {_ffmpeg_src}")
+    print(f"[WARN] 打包后将不包含 FFmpeg，视频功能不可用")
 
 # ── Hidden Imports ────────────────────────────────────────────
 # PyInstaller 无法自动检测的模块
@@ -225,7 +244,7 @@ excludes = [
 a = Analysis(
     ['main.py'],
     pathex=[PROJECT_DIR],
-    binaries=[],
+    binaries=_ffmpeg_binaries,
     datas=datas,
     hiddenimports=hidden_imports,
     hookspath=[],
@@ -242,7 +261,7 @@ a = Analysis(
 pyz = PYZ(a.pure, cipher=block_cipher)
 
 # ══════════════════════════════════════════════════════════════
-#  EXE (单文件输出)
+#  EXE
 # ══════════════════════════════════════════════════════════════
 # 如果项目根目录有 QtCoder.ico 则使用，否则无图标
 _icon = os.path.join(PROJECT_DIR, 'QtCoder.ico')
@@ -251,9 +270,8 @@ _icon_param = [_icon] if os.path.isfile(_icon) else []
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.datas,
     [],
+    exclude_binaries=True,          # 文件夹模式：二进制文件由 COLLECT 收集
     name='QtCoder',
     debug=False,
     bootloader_ignore_signals=False,
@@ -268,4 +286,17 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     icon=_icon_param,
+)
+
+# ══════════════════════════════════════════════════════════════
+#  COLLECT (文件夹打包)
+# ══════════════════════════════════════════════════════════════
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.datas,
+    strip=False,
+    upx=True,
+    upx_exclude=[],
+    name='QtCoder',
 )
