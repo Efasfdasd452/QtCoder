@@ -176,6 +176,15 @@ hidden_imports = [
     'ui.panels.watermark_panel',
     'ui.panels.firewall_panel',
     'ui.panels.video_panel',
+    'ui.panels.image_panel',
+
+    # ── 图片压缩 (Pillow) ───────────────────────────────────
+    'PIL',
+    'PIL.Image',
+    'PIL.JpegImagePlugin',
+    'PIL.PngImagePlugin',
+    'PIL.WebPImagePlugin',
+    'core.image_compress',
 
     # ── 水印检测 ───────────────────────────────────────────
     'core.watermark_detector',

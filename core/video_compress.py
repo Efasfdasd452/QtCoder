@@ -11,9 +11,10 @@
 import json
 import os
 import re
+import shutil
 import subprocess
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import List, Optional, Tuple
 
 _NO_WINDOW = {"creationflags": 0x08000000} if os.name == "nt" else {}
 
@@ -324,13 +325,75 @@ def parse_progress(line: str, total_dur: float) -> Optional[dict]:
     return {"percent": pct, "current": cur, "speed": spd, "eta": eta}
 
 
-# ── 支持的格式 ───────────────────────────────────────────────
+# ── 支持的格式（主流视频格式，用于单文件与批量）────────────────
 
 VIDEO_EXTS = (
     ".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm",
     ".m2ts", ".mts", ".ts", ".m4v", ".mpg", ".mpeg", ".vob",
     ".3gp", ".ogv", ".rm", ".rmvb", ".asf", ".f4v",
 )
+
+
+def _ext_is_video(name: str) -> bool:
+    return name.lower().endswith(VIDEO_EXTS)
+
+
+def collect_videos_from_folder(
+    folder: str, recursive: bool = True
+) -> List[str]:
+    """从文件夹收集所有视频文件路径；recursive=True 时包含子文件夹。"""
+    if not os.path.isdir(folder):
+        return []
+    out = []
+    if recursive:
+        for root, _dirs, files in os.walk(folder):
+            for f in files:
+                if _ext_is_video(f):
+                    out.append(os.path.normpath(os.path.join(root, f)))
+    else:
+        for f in os.listdir(folder):
+            path = os.path.join(folder, f)
+            if os.path.isfile(path) and _ext_is_video(f):
+                out.append(os.path.normpath(path))
+    return sorted(out)
+
+
+# 各预设下预估压缩后约为原大小的比例（经验值，用于批量预估）
+PRESET_ESTIMATE_RATIO = {
+    "compat": 0.65,
+    "balanced": 0.45,
+    "max_compress": 0.35,
+}
+
+
+def estimate_one_file_size(size_bytes: int, preset_key: str) -> int:
+    """单文件按预设估算压缩后字节数。"""
+    ratio = PRESET_ESTIMATE_RATIO.get(preset_key, 0.45)
+    return int(size_bytes * ratio)
+
+
+def estimate_compressed_size(
+    file_paths_with_size: List[Tuple[str, int]],
+    preset_key: str,
+) -> int:
+    """根据预设估算压缩后总字节数。file_paths_with_size: [(path, size_bytes), ...]"""
+    return sum(
+        estimate_one_file_size(size, preset_key)
+        for _, size in file_paths_with_size
+    )
+
+
+def get_disk_free_bytes(path: str) -> int:
+    """返回 path 所在磁盘的可用空间（字节）。"""
+    path = os.path.abspath(path)
+    if not os.path.exists(path):
+        path = os.path.dirname(path)
+    if not path or not os.path.exists(path):
+        return 0
+    try:
+        return shutil.disk_usage(path).free
+    except OSError:
+        return 0
 
 VIDEO_FILTER = (
     "视频文件 (" + " ".join(f"*{e}" for e in VIDEO_EXTS) + ");;"

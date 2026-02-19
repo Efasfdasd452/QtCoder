@@ -39,6 +39,7 @@ from .panels.identifier_panel import IdentifierPanel
 from .panels.watermark_panel  import WatermarkPanel
 from .panels.firewall_panel   import FirewallPanel
 from .panels.video_panel      import VideoPanel
+from .panels.image_panel      import ImagePanel
 
 # ── 功能注册表 ───────────────────────────────────────────────
 # (分类名, 分类色, [(显示名, 简介, Panel类), ...])
@@ -71,6 +72,7 @@ FEATURES = [
     ("媒体工具", "#e74856", [
         ("水印检测",      "隐藏水印检测/嵌入/提取 (blind_watermark + 多维度分析)", WatermarkPanel),
         ("视频压缩",      "FFmpeg 视频压缩 · H.264/H.265/AV1 · 硬件加速", VideoPanel),
+        ("图片压缩",      "批量文件夹压缩 · 肉眼无差异（JPEG/PNG/WebP）", ImagePanel),
     ]),
 ]
 
