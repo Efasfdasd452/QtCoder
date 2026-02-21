@@ -68,6 +68,33 @@ class VideoInfo:
         return f"{self.width}×{self.height}" if self.width else "未知"
 
     @property
+    def resolution_tier_str(self) -> str:
+        """根据短边或高度返回规格：4K / 2K / 1080p / 720p / 480p / 360p / 其他"""
+        h = self.height or 0
+        w = self.width or 0
+        if h <= 0 and w <= 0:
+            return "未知"
+        # 竖屏以宽为短边，横屏以高为短边
+        short = min(w, h) if (w and h) else (h or w)
+        if short >= 2160:
+            return "4K"
+        if short >= 1440:
+            return "2K"
+        if short >= 1080:
+            return "1080p"
+        if short >= 720:
+            return "720p"
+        if short >= 480:
+            return "480p"
+        if short >= 360:
+            return "360p"
+        if short >= 240:
+            return "240p"
+        if short > 0:
+            return "其他"
+        return "未知"
+
+    @property
     def video_bitrate_str(self) -> str:
         if self.video_bitrate >= 1000:
             return f"{self.video_bitrate / 1000:.1f} Mbps"
@@ -193,6 +220,14 @@ AUDIO_OPTS = [
     ("aac_128", "AAC 128 kbps (体积小)"),
 ]
 
+# 输出帧率：0=保持源帧率；48=折中（流畅与体积平衡）；30/24=更小体积
+OUTPUT_FPS_OPTS = [
+    (0.0,  "保持原始"),
+    (48.0, "48 fps（折中：比60小、比30顺）"),
+    (30.0, "30 fps（体积更小）"),
+    (24.0, "24 fps（更小）"),
+]
+
 
 # ── 硬件编码器检测 ───────────────────────────────────────────
 
@@ -254,6 +289,8 @@ class CompressConfig:
     target_width: int = 0       # 0 = 保持原始
     target_height: int = 0
     audio_mode: str = "aac_192"
+    input_fps: float = 0.0     # 源视频帧率（用于 -r 当 output_fps=0）
+    output_fps: float = 0.0    # 0=保持源帧率，>0=强制该帧率（如 30 可显著减小体积）
 
     @classmethod
     def from_preset(cls, key: str, inp: str, out: str):
@@ -270,7 +307,12 @@ def build_command(cfg: CompressConfig) -> list:
     if not ff:
         raise FileNotFoundError("未找到 ffmpeg")
 
-    cmd = [ff, "-y", "-hide_banner", "-i", cfg.input_path]
+    # 要降帧时必须在输入端加 -r，否则解码仍按源帧率喂给编码器，体积不会变小
+    r_out = cfg.output_fps if cfg.output_fps > 0 else cfg.input_fps
+    cmd = [ff, "-y", "-hide_banner"]
+    if r_out > 0 and cfg.output_fps > 0:
+        cmd += ["-r", str(round(r_out, 3))]
+    cmd += ["-i", cfg.input_path]
 
     cmd += ["-c:v", cfg.vcodec]
 
@@ -289,6 +331,7 @@ def build_command(cfg: CompressConfig) -> list:
         cmd += ["-crf", str(cfg.crf), "-b:v", "0", "-cpu-used", cpu,
                 "-row-mt", "1"]
     elif "nvenc" in vc:
+        # NVENC 的 CQ 与 x265 CRF 标度不同：CQ 18 与 20 体积差异常很小，属硬件编码器特性
         preset = {"ultrafast": "p1", "superfast": "p2", "veryfast": "p3",
                   "faster": "p4", "fast": "p5", "medium": "p5",
                   "slow": "p6", "slower": "p7", "veryslow": "p7"
@@ -302,6 +345,10 @@ def build_command(cfg: CompressConfig) -> list:
 
     if cfg.target_width > 0:
         cmd += ["-vf", f"scale={cfg.target_width}:-2:flags=lanczos,setsar=1"]
+
+    # 输出端也标上帧率（降帧时已在输入端用 -r 限流，这里保证 muxer 一致）
+    if r_out > 0:
+        cmd += ["-r", str(round(r_out, 3))]
 
     if cfg.audio_mode == "copy":
         cmd += ["-c:a", "copy"]
@@ -382,12 +429,38 @@ PRESET_ESTIMATE_RATIO = {
     "compat": 0.65,
     "balanced": 0.45,
     "max_compress": 0.35,
+    "custom": 0.45,   # 仅当未传自定义参数时的回退
 }
+
+
+def get_custom_estimate_ratio(crf: int, output_fps: float) -> float:
+    """根据自定义 CRF 与输出帧率估算压缩比。output_fps=0 表示保持源帧率。"""
+    # CRF 经验比例（H.265 大致范围）
+    if crf <= 18:
+        base = 0.55
+    elif crf <= 23:
+        base = 0.55 - (crf - 18) * 0.04
+    elif crf <= 30:
+        base = 0.35 - (crf - 23) * 0.02
+    else:
+        base = 0.22
+    # 输出帧率：若指定则按 60fps 源折算（30→0.5, 48→0.8）
+    if output_fps and output_fps > 0:
+        base *= (output_fps / 60.0)
+    return max(0.15, min(0.9, base))
 
 
 def estimate_one_file_size(size_bytes: int, preset_key: str) -> int:
     """单文件按预设估算压缩后字节数。"""
     ratio = PRESET_ESTIMATE_RATIO.get(preset_key, 0.45)
+    return int(size_bytes * ratio)
+
+
+def estimate_one_file_size_custom(
+    size_bytes: int, crf: int, output_fps: float = 0.0
+) -> int:
+    """单文件按自定义 CRF、输出帧率估算压缩后字节数。"""
+    ratio = get_custom_estimate_ratio(crf, output_fps)
     return int(size_bytes * ratio)
 
 
@@ -398,6 +471,18 @@ def estimate_compressed_size(
     """根据预设估算压缩后总字节数。file_paths_with_size: [(path, size_bytes), ...]"""
     return sum(
         estimate_one_file_size(size, preset_key)
+        for _, size in file_paths_with_size
+    )
+
+
+def estimate_compressed_size_custom(
+    file_paths_with_size: List[Tuple[str, int]],
+    crf: int,
+    output_fps: float = 0.0,
+) -> int:
+    """根据自定义 CRF、输出帧率估算压缩后总字节数。"""
+    return sum(
+        estimate_one_file_size_custom(size, crf, output_fps)
         for _, size in file_paths_with_size
     )
 

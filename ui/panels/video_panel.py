@@ -25,13 +25,15 @@ from PyQt5.QtCore import Qt, QThread, pyqtSignal
 
 from core.video_compress import (
     find_ffmpeg, probe_video, VideoInfo,
-    PRESETS, CODECS, SPEEDS, RESOLUTIONS, AUDIO_OPTS,
+    PRESETS, CODECS, SPEEDS, RESOLUTIONS, AUDIO_OPTS, OUTPUT_FPS_OPTS,
     CompressConfig, build_command, parse_progress,
     VIDEO_EXTS, VIDEO_FILTER, OUTPUT_FILTER,
     detect_hw_encoders, auto_select_encoder,
     collect_videos_from_folder,
     estimate_compressed_size,
+    estimate_compressed_size_custom,
     estimate_one_file_size,
+    estimate_one_file_size_custom,
     PRESET_ESTIMATE_RATIO,
     get_disk_free_bytes,
 )
@@ -165,11 +167,12 @@ class _BatchCompressWorker(QThread):
     file_done = pyqtSignal(int, bool, str)   # index, success, message
     finished = pyqtSignal(bool, str)
 
-    def __init__(self, tasks, hw_encoders=None):
+    def __init__(self, tasks, hw_encoders=None, encoder_mode="auto"):
         super().__init__()
-        # tasks: [(input_path, output_path, preset_key), ...]
+        # tasks: [(input_path, output_path, preset_key)] 或 [(input_path, output_path, preset_key, custom_params)]
         self._tasks = list(tasks)
         self._hw_encoders = hw_encoders or []
+        self._encoder_mode = encoder_mode
         self._cancelled = False
         self._proc = None
 
@@ -179,7 +182,10 @@ class _BatchCompressWorker(QThread):
             self.finished.emit(False, "没有待压缩文件")
             return
         failed = []
-        for i, (inp, out, preset_key) in enumerate(self._tasks):
+        for i, item in enumerate(self._tasks):
+            inp, out = item[0], item[1]
+            preset_key = item[2]
+            custom_params = item[3] if len(item) > 3 else None
             if self._cancelled:
                 self.finished.emit(False, "已取消")
                 return
@@ -190,10 +196,28 @@ class _BatchCompressWorker(QThread):
                 self.file_done.emit(i, False, str(e))
                 failed.append(os.path.basename(inp))
                 continue
-            cfg = CompressConfig.from_preset(preset_key, inp, out)
-            cfg.vcodec = auto_select_encoder(cfg.vcodec, self._hw_encoders)
+            if custom_params:
+                cfg = CompressConfig(
+                    input_path=inp, output_path=out,
+                    vcodec=custom_params.get("vcodec", "libx265"),
+                    crf=int(custom_params.get("crf", 20)),
+                    speed=custom_params.get("speed", "medium"),
+                    audio_mode=custom_params.get("audio_mode", "aac_192"),
+                    target_width=int(custom_params.get("target_width", 0)),
+                    target_height=int(custom_params.get("target_height", 0)),
+                    output_fps=float(custom_params.get("output_fps", 0)),
+                )
+            else:
+                cfg = CompressConfig.from_preset(preset_key, inp, out)
+                if self._encoder_mode != "cpu_only":
+                    cfg.vcodec = auto_select_encoder(cfg.vcodec, self._hw_encoders)
+            # custom_params 时 vcodec 已在主线程按「编码」模式选好，不再替换
+            # 保持源帧率：原多少 fps 压缩后仍多少 fps
+            if info.fps > 0:
+                cfg.input_fps = info.fps
             try:
                 cmd = build_command(cfg)
+                self.log_line.emit(f"[{os.path.basename(inp)}] 参数: -c:v {cfg.vcodec} CRF/CQ={cfg.crf} output_fps={cfg.output_fps or cfg.input_fps}")
             except Exception as e:
                 self.log_line.emit(f"[{os.path.basename(inp)}] 构建命令失败: {e}")
                 self.file_done.emit(i, False, str(e))
@@ -388,8 +412,9 @@ class VideoPanel(QWidget):
         self._crf_spin.setValue(20)
         self._crf_spin.setFixedHeight(28)
         self._crf_spin.setToolTip(
-            "0 = 无损  18 = 视觉无损  23 = 高质量  28 = 中等\n"
-            "越低画质越好、文件越大")
+            "0 = 无损  H.265 约 16–18 肉眼几乎无差异  20 = 高画质  23+ = 体积更小\n"
+            "越低画质越好、文件越大\n"
+            "说明：用显卡编码(NVENC/QSV/AMF)时，CRF 18 与 20 体积常只差一点；要明显差异请选「H.265」软件编码。")
         r1.addWidget(self._crf_spin)
         self._crf_hint = QLabel("高画质")
         self._crf_hint.setStyleSheet("color:#107c10;font-size:11px;")
@@ -415,6 +440,16 @@ class VideoPanel(QWidget):
         self._res_combo.setMinimumWidth(180)
         self._res_combo.setFixedHeight(28)
         r2.addWidget(self._res_combo)
+        r2.addSpacing(16)
+        r2.addWidget(QLabel("输出帧率:"))
+        self._fps_combo = QComboBox()
+        for val, name in OUTPUT_FPS_OPTS:
+            self._fps_combo.addItem(name, val)
+        self._fps_combo.setMinimumWidth(160)
+        self._fps_combo.setFixedHeight(28)
+        self._fps_combo.setToolTip(
+            "保持原始=与源一致；48=折中（体积与流畅平衡）；30/24=更小体积（60→30 约减半）")
+        r2.addWidget(self._fps_combo)
         r2.addStretch()
         cl.addLayout(r2)
 
@@ -496,10 +531,87 @@ class VideoPanel(QWidget):
         self._batch_unified_preset = QComboBox()
         for key, p in PRESETS.items():
             self._batch_unified_preset.addItem(p["name"], key)
+        self._batch_unified_preset.addItem("自定义", "custom")
+        self._batch_unified_preset.currentIndexChanged.connect(self._on_batch_unified_preset_changed)
         self._batch_unified_preset.currentIndexChanged.connect(self._update_batch_estimate)
         preset_row_b.addWidget(self._batch_unified_preset)
         preset_row_b.addStretch()
         bg2l.addWidget(self._batch_unified_row)
+        # 批量「自定义」时复用的单文件式参数面板
+        self._batch_custom_widget = QWidget()
+        self._batch_custom_widget.setVisible(False)
+        bcl = QVBoxLayout(self._batch_custom_widget)
+        bcl.setContentsMargins(0, 8, 0, 0)
+        bcl.setSpacing(6)
+        br1 = QHBoxLayout()
+        br1.addWidget(QLabel("编码器:"))
+        self._batch_codec_combo = QComboBox()
+        for codec, name in CODECS:
+            self._batch_codec_combo.addItem(name, codec)
+        self._batch_codec_combo.setCurrentIndex(1)
+        self._batch_codec_combo.setMinimumWidth(220)
+        self._batch_codec_combo.setFixedHeight(28)
+        br1.addWidget(self._batch_codec_combo)
+        br1.addSpacing(16)
+        br1.addWidget(QLabel("CRF:"))
+        self._batch_crf_spin = QSpinBox()
+        self._batch_crf_spin.setRange(0, 51)
+        self._batch_crf_spin.setValue(20)
+        self._batch_crf_spin.setFixedHeight(28)
+        self._batch_crf_spin.setToolTip(
+            "0=无损  H.265 约 16–18 肉眼几乎无差异  20=高画质  23+=体积更小\n"
+            "越低画质越好、文件越大\n"
+            "说明：用显卡编码时 CRF 18 与 20 体积常只差一点；要明显差异请选「H.265」软件编码。")
+        br1.addWidget(self._batch_crf_spin)
+        self._batch_crf_hint = QLabel("高画质")
+        self._batch_crf_hint.setStyleSheet("color:#107c10;font-size:11px;")
+        br1.addWidget(self._batch_crf_hint)
+        self._batch_crf_spin.valueChanged.connect(self._on_batch_crf_changed)
+        self._batch_crf_spin.valueChanged.connect(self._update_batch_estimate)
+        br1.addStretch()
+        bcl.addLayout(br1)
+        br2 = QHBoxLayout()
+        br2.addWidget(QLabel("编码速度:"))
+        self._batch_speed_combo = QComboBox()
+        for speed, name in SPEEDS:
+            self._batch_speed_combo.addItem(name, speed)
+        self._batch_speed_combo.setCurrentIndex(5)
+        self._batch_speed_combo.setMinimumWidth(160)
+        self._batch_speed_combo.setFixedHeight(28)
+        br2.addWidget(self._batch_speed_combo)
+        br2.addSpacing(16)
+        br2.addWidget(QLabel("分辨率:"))
+        self._batch_res_combo = QComboBox()
+        for w, h, name in RESOLUTIONS:
+            self._batch_res_combo.addItem(name, (w, h))
+        self._batch_res_combo.setMinimumWidth(180)
+        self._batch_res_combo.setFixedHeight(28)
+        br2.addWidget(self._batch_res_combo)
+        br2.addSpacing(16)
+        br2.addWidget(QLabel("输出帧率:"))
+        self._batch_fps_combo = QComboBox()
+        for val, name in OUTPUT_FPS_OPTS:
+            self._batch_fps_combo.addItem(name, val)
+        self._batch_fps_combo.setMinimumWidth(160)
+        self._batch_fps_combo.setFixedHeight(28)
+        self._batch_fps_combo.setToolTip(
+            "保持原始=与源一致；48=折中；30/24=更小体积")
+        self._batch_fps_combo.currentIndexChanged.connect(self._update_batch_estimate)
+        br2.addWidget(self._batch_fps_combo)
+        br2.addStretch()
+        bcl.addLayout(br2)
+        br3 = QHBoxLayout()
+        br3.addWidget(QLabel("音频:"))
+        self._batch_audio_combo = QComboBox()
+        for mode, name in AUDIO_OPTS:
+            self._batch_audio_combo.addItem(name, mode)
+        self._batch_audio_combo.setCurrentIndex(2)
+        self._batch_audio_combo.setMinimumWidth(180)
+        self._batch_audio_combo.setFixedHeight(28)
+        br3.addWidget(self._batch_audio_combo)
+        br3.addStretch()
+        bcl.addLayout(br3)
+        bg2l.addWidget(self._batch_custom_widget)
         self._batch_table = QTableWidget()
         self._batch_table.setColumnCount(4)
         self._batch_table.setHorizontalHeaderLabels(["文件名", "预设", "原始大小", "预估大小"])
@@ -526,6 +638,19 @@ class VideoPanel(QWidget):
         bl.addStretch()
         self._tabs.addTab(self._batch_tab_widget, "批量（文件夹）")
 
+        encoder_mode_row = QHBoxLayout()
+        encoder_mode_row.addWidget(QLabel("编码:"))
+        self._encoder_mode_combo = QComboBox()
+        self._encoder_mode_combo.addItem("自动（优先显卡）", "auto")
+        self._encoder_mode_combo.addItem("仅显卡", "gpu_only")
+        self._encoder_mode_combo.addItem("仅 CPU", "cpu_only")
+        self._encoder_mode_combo.setMinimumWidth(140)
+        self._encoder_mode_combo.setFixedHeight(28)
+        self._encoder_mode_combo.setToolTip(
+            "自动=有显卡就用显卡；仅显卡=强制 NVENC/QSV/AMF；仅 CPU=强制 libx264/libx265（慢但体积/画质更好）")
+        encoder_mode_row.addWidget(self._encoder_mode_combo)
+        encoder_mode_row.addStretch()
+        root.addLayout(encoder_mode_row)
         root.addWidget(self._tabs, stretch=1)
 
         # ── 操作行 ──
@@ -611,6 +736,16 @@ class VideoPanel(QWidget):
 
     # ── 硬件加速检测 ─────────────────────────────────────────
 
+    def _ensure_hw_encoders_ready(self):
+        """若硬件检测仍在进行，短时等待再继续，保证单文件/批量用同一套编码器列表。"""
+        worker = getattr(self, "_hw_detect_worker", None)
+        if not worker or not worker.isRunning():
+            return
+        deadline = time.time() + 3.0
+        while worker.isRunning() and time.time() < deadline:
+            QApplication.processEvents()
+            time.sleep(0.05)
+
     def _detect_hw(self):
         if not find_ffmpeg():
             return
@@ -631,6 +766,9 @@ class VideoPanel(QWidget):
         self._hw_label.setText(f"检测到硬件编码器: {names}")
         self._status.setText(
             f"GPU 硬件加速可用: {names}  —  使用预设时将自动启用")
+        for codec, name in encoders:
+            if self._batch_codec_combo.findData(codec) == -1:
+                self._batch_codec_combo.addItem(f"{name} (硬件)", codec)
 
     # ── Drag & Drop ──────────────────────────────────────────
 
@@ -705,9 +843,10 @@ class VideoPanel(QWidget):
         self._info = info
         self._file_label.setText(os.path.basename(path))
 
+        codec_display = (info.video_codec or "未知").upper()
         self._lbl_video.setText(
-            f"视频: {info.video_codec.upper()}  {info.resolution_str}  "
-            f"{info.fps:.3g} fps  {info.video_bitrate_str}")
+            f"视频: {codec_display}  ·  {info.resolution_str} ({info.resolution_tier_str})  ·  "
+            f"{info.video_bitrate_str}  ·  {info.fps:.3g} fps")
         self._lbl_audio.setText(f"音频: {info.audio_info_str}")
         self._lbl_file.setText(
             f"时长: {info.duration_str}  大小: {info.file_size_str}")
@@ -731,8 +870,17 @@ class VideoPanel(QWidget):
         if self._multi_videos:
             folder = QFileDialog.getExistingDirectory(self, "选择输出文件夹（多选批量）")
             if folder:
-                preset = self._get_single_preset_key()
-                est = sum(estimate_one_file_size(s, preset) for _, s in self._multi_videos)
+                if self._preset_btns["custom"].isChecked():
+                    ofps = self._fps_combo.currentData()
+                    ofps = float(ofps) if ofps is not None else 0.0
+                    est = estimate_compressed_size_custom(
+                        self._multi_videos,
+                        self._crf_spin.value(),
+                        ofps,
+                    )
+                else:
+                    preset = self._get_single_preset_key()
+                    est = sum(estimate_one_file_size(s, preset) for _, s in self._multi_videos)
                 free = get_disk_free_bytes(folder)
                 if free > 0 and est > free:
                     r = QMessageBox.warning(
@@ -828,6 +976,8 @@ class VideoPanel(QWidget):
     def _on_crf_changed(self, val):
         if val <= 15:
             txt, color = "极高画质 (文件较大)", "#0078d4"
+        elif val <= 18:
+            txt, color = "肉眼几乎无差异 (H.265 推荐)", "#107c10"
         elif val <= 20:
             txt, color = "高画质 (推荐)", "#107c10"
         elif val <= 25:
@@ -844,6 +994,7 @@ class VideoPanel(QWidget):
     def _build_config(self) -> CompressConfig:
         if not self._output_path:
             raise ValueError("请选择输出路径")
+        self._ensure_hw_encoders_ready()
 
         is_custom = self._preset_btns["custom"].isChecked()
 
@@ -860,6 +1011,11 @@ class VideoPanel(QWidget):
             if w > 0 and self._info and w < self._info.width:
                 cfg.target_width = w
                 cfg.target_height = h
+            ofps = self._fps_combo.currentData()
+            if ofps is not None and ofps > 0:
+                cfg.output_fps = float(ofps)
+            if self._encoder_mode_combo.currentData() != "cpu_only":
+                cfg.vcodec = auto_select_encoder(cfg.vcodec, self._hw_encoders)
         else:
             preset_key = "balanced"
             for key, rb in self._preset_btns.items():
@@ -868,8 +1024,11 @@ class VideoPanel(QWidget):
                     break
             cfg = CompressConfig.from_preset(
                 preset_key, self._info.path, self._output_path)
-            cfg.vcodec = auto_select_encoder(cfg.vcodec, self._hw_encoders)
-
+            if self._encoder_mode_combo.currentData() != "cpu_only":
+                cfg.vcodec = auto_select_encoder(cfg.vcodec, self._hw_encoders)
+        # 保持源帧率：原多少 fps 压缩后仍多少 fps
+        if self._info and self._info.fps > 0:
+            cfg.input_fps = self._info.fps
         return cfg
 
     # ── 开始 / 取消 ──────────────────────────────────────────
@@ -1065,8 +1224,31 @@ class VideoPanel(QWidget):
     def _on_batch_mode_changed(self):
         unified = self._batch_mode_unified.isChecked()
         self._batch_unified_row.setVisible(unified)
+        is_custom = self._batch_unified_preset.currentData() == "custom"
+        self._batch_custom_widget.setVisible(unified and is_custom)
         self._batch_table.setVisible(not unified and len(self._batch_videos) > 0)
         self._update_batch_estimate()
+
+    def _on_batch_unified_preset_changed(self):
+        is_custom = self._batch_unified_preset.currentData() == "custom"
+        self._batch_custom_widget.setVisible(
+            self._batch_mode_unified.isChecked() and is_custom)
+
+    def _on_batch_crf_changed(self, val):
+        if val <= 15:
+            txt, color = "极高画质 (文件较大)", "#0078d4"
+        elif val <= 18:
+            txt, color = "肉眼几乎无差异 (H.265 推荐)", "#107c10"
+        elif val <= 20:
+            txt, color = "高画质 (推荐)", "#107c10"
+        elif val <= 25:
+            txt, color = "中高画质", "#ca5010"
+        elif val <= 30:
+            txt, color = "中等画质", "#d13438"
+        else:
+            txt, color = "低画质 (文件很小)", "#d13438"
+        self._batch_crf_hint.setText(txt)
+        self._batch_crf_hint.setStyleSheet(f"color:{color};font-size:11px;")
 
     def _update_batch_estimate(self):
         if not self._batch_videos:
@@ -1075,7 +1257,16 @@ class VideoPanel(QWidget):
         if self._batch_mode_unified.isChecked():
             preset_key = self._batch_unified_preset.currentData()
             total_orig = sum(s for _, s in self._batch_videos)
-            est_bytes = estimate_compressed_size(self._batch_videos, preset_key)
+            if preset_key == "custom":
+                ofps = self._batch_fps_combo.currentData()
+                ofps = float(ofps) if ofps is not None else 0.0
+                est_bytes = estimate_compressed_size_custom(
+                    self._batch_videos,
+                    self._batch_crf_spin.value(),
+                    ofps,
+                )
+            else:
+                est_bytes = estimate_compressed_size(self._batch_videos, preset_key)
             ratio = (est_bytes / total_orig * 100) if total_orig else 0
             self._batch_estimate_label.setText(
                 f"预估压缩后总大小约 {_fmt_size(est_bytes)}（约为原大小的 {ratio:.0f}%）"
@@ -1109,7 +1300,16 @@ class VideoPanel(QWidget):
         # 计算当前预估总大小
         if self._batch_mode_unified.isChecked():
             preset_key = self._batch_unified_preset.currentData()
-            est_bytes = estimate_compressed_size(self._batch_videos, preset_key)
+            if preset_key == "custom":
+                ofps = self._batch_fps_combo.currentData()
+                ofps = float(ofps) if ofps is not None else 0.0
+                est_bytes = estimate_compressed_size_custom(
+                    self._batch_videos,
+                    self._batch_crf_spin.value(),
+                    ofps,
+                )
+            else:
+                est_bytes = estimate_compressed_size(self._batch_videos, preset_key)
         else:
             est_bytes = 0
             for i in range(self._batch_table.rowCount()):
@@ -1142,6 +1342,7 @@ class VideoPanel(QWidget):
             return
         if self._batch_worker and self._batch_worker.isRunning():
             return
+        self._ensure_hw_encoders_ready()
         preset = self._get_single_preset_key()
         out_dir = os.path.normpath(self._multi_output_dir)
         tasks = []
@@ -1168,7 +1369,10 @@ class VideoPanel(QWidget):
         self._progress_label.setVisible(True)
         self._result_frame.setVisible(False)
         self._status.setText("批量压缩中…")
-        self._batch_worker = _BatchCompressWorker(tasks, hw_encoders=self._hw_encoders)
+        encoder_mode = self._encoder_mode_combo.currentData() or "auto"
+        self._batch_worker = _BatchCompressWorker(
+            tasks, hw_encoders=self._hw_encoders, encoder_mode=encoder_mode
+        )
         self._batch_worker.progress.connect(self._on_batch_progress)
         self._batch_worker.log_line.connect(self._on_log)
         self._batch_worker.finished.connect(self._on_batch_finished)
@@ -1183,21 +1387,66 @@ class VideoPanel(QWidget):
             return
         if self._batch_worker and self._batch_worker.isRunning():
             return
-        # 构建任务列表：(input_path, output_path, preset_key)
+        self._ensure_hw_encoders_ready()
+        # 构建任务列表：与单文件「推荐均衡」等预设完全一致（含主线程解析显卡编码器）
         tasks = []
         src = os.path.normpath(self._batch_source_dir)
         out_dir = os.path.normpath(self._batch_output_dir)
+        if self._batch_mode_unified.isChecked():
+            preset_key = self._batch_unified_preset.currentData()
+            if preset_key == "custom":
+                w, h = self._batch_res_combo.currentData()
+                ofps = self._batch_fps_combo.currentData()
+                if ofps is None:
+                    ofps = 0.0
+                raw_vcodec = self._batch_codec_combo.currentData()
+                if self._encoder_mode_combo.currentData() == "cpu_only":
+                    resolved_vcodec = raw_vcodec
+                else:
+                    resolved_vcodec = auto_select_encoder(raw_vcodec, self._hw_encoders)
+                base_custom = {
+                    "vcodec": resolved_vcodec,
+                    "crf": self._batch_crf_spin.value(),
+                    "speed": self._batch_speed_combo.currentData(),
+                    "audio_mode": self._batch_audio_combo.currentData(),
+                    "target_width": w if w else 0,
+                    "target_height": h if w else 0,
+                    "output_fps": float(ofps),
+                }
+            elif preset_key in PRESETS:
+                # 与单文件同一套逻辑：先 from_preset 再 auto_select_encoder，保证同视频同参数同体积
+                first_in = self._batch_videos[0][0]
+                rel0 = os.path.relpath(first_in, src)
+                base0, ext0 = os.path.splitext(rel0)
+                first_out = os.path.join(out_dir, base0 + "_compressed" + ext0)
+                cfg = CompressConfig.from_preset(preset_key, first_in, first_out)
+                if self._encoder_mode_combo.currentData() != "cpu_only":
+                    cfg.vcodec = auto_select_encoder(cfg.vcodec, self._hw_encoders)
+                base_custom = {
+                    "vcodec": cfg.vcodec,
+                    "crf": cfg.crf,
+                    "speed": cfg.speed,
+                    "audio_mode": cfg.audio_mode,
+                    "target_width": 0,
+                    "target_height": 0,
+                }
+                preset_key = "custom"
+            else:
+                base_custom = None
         for i, (path, _) in enumerate(self._batch_videos):
             rel = os.path.relpath(path, src)
             base, ext = os.path.splitext(rel)
             new_rel = base + "_compressed" + ext
             out_path = os.path.join(out_dir, new_rel)
             if self._batch_mode_unified.isChecked():
-                preset_key = self._batch_unified_preset.currentData()
+                if base_custom is not None:
+                    tasks.append((path, out_path, "custom", base_custom))
+                else:
+                    tasks.append((path, out_path, self._batch_unified_preset.currentData()))
             else:
                 combo = self._batch_table.cellWidget(i, 1)
                 preset_key = combo.currentData() if combo else "balanced"
-            tasks.append((path, out_path, preset_key))
+                tasks.append((path, out_path, preset_key))
         self._log_area.clear()
         self._log_area.setVisible(True)
         self._log_btn.setText("隐藏日志 ▴")
@@ -1210,7 +1459,10 @@ class VideoPanel(QWidget):
         self._progress_label.setText("准备中…")
         self._result_frame.setVisible(False)
         self._status.setText("批量压缩中…")
-        self._batch_worker = _BatchCompressWorker(tasks, hw_encoders=self._hw_encoders)
+        encoder_mode = self._encoder_mode_combo.currentData() or "auto"
+        self._batch_worker = _BatchCompressWorker(
+            tasks, hw_encoders=self._hw_encoders, encoder_mode=encoder_mode
+        )
         self._batch_worker.progress.connect(self._on_batch_progress)
         self._batch_worker.log_line.connect(self._on_log)
         self._batch_worker.finished.connect(self._on_batch_finished)
