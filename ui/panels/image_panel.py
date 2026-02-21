@@ -536,7 +536,12 @@ class ImagePanel(QWidget):
         # 批量（文件夹）页
         preset = self._batch_preset.currentData() or "balanced"
         if not self._images:
-            QMessageBox.information(self, "提示", "请先选择源文件夹")
+            if not self._source_dir or not os.path.isdir(self._source_dir):
+                QMessageBox.information(self, "提示", "请先选择源文件夹")
+            else:
+                QMessageBox.information(
+                    self, "提示",
+                    "当前源文件夹内未找到图片。\n请更换文件夹或勾选「包含子文件夹」后再试。")
             return
         if not self._output_dir or not os.path.isdir(self._output_dir):
             QMessageBox.information(self, "提示", "请先选择输出文件夹")
@@ -551,6 +556,16 @@ class ImagePanel(QWidget):
             tasks.append((path, os.path.join(out_dir, new_rel)))
         self._run_batch(tasks, preset, is_single_tab=False)
 
+    def _set_controls_enabled_for_run(self, enabled: bool):
+        """压缩进行中时禁用文件/输出选择，避免中途改配置。"""
+        self._open_btn.setEnabled(enabled)
+        self._open_multi_btn.setEnabled(enabled)
+        self._out_btn.setEnabled(enabled)
+        self._src_btn.setEnabled(enabled)
+        self._batch_out_btn.setEnabled(enabled)
+        if hasattr(self, "_recursive"):
+            self._recursive.setEnabled(enabled)
+
     def _run_batch(self, tasks, preset_key="balanced", is_single_tab=False):
         self._log_area.clear()
         self._log_area.setVisible(True)
@@ -558,6 +573,7 @@ class ImagePanel(QWidget):
         self._start_btn.setEnabled(False)
         self._cancel_btn.setEnabled(True)
         self._cancel_btn.setVisible(True)
+        self._set_controls_enabled_for_run(False)
         self._progress.setVisible(True)
         self._progress.setValue(0)
         self._progress_label.setVisible(True)
@@ -584,6 +600,7 @@ class ImagePanel(QWidget):
         self._start_btn.setEnabled(True)
         self._cancel_btn.setEnabled(False)
         self._cancel_btn.setVisible(False)
+        self._set_controls_enabled_for_run(True)
         self._progress.setVisible(False)
         self._progress_label.setVisible(False)
         if is_single_tab:

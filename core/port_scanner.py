@@ -67,6 +67,7 @@ def parse_ports(text):
         if '-' in part:
             lo, hi = part.split('-', 1)
             lo, hi = int(lo), int(hi)
+            lo, hi = min(lo, hi), max(lo, hi)
             if hi - lo > 5000:
                 raise ValueError(f"端口范围过大: {lo}-{hi}（最多 5000 个端口）")
             for p in range(lo, hi + 1):

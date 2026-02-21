@@ -132,7 +132,13 @@ class IdentifierPanel(QWidget):
             self._status.setText("请先粘贴要识别的字符串")
             return
 
-        result = identify(text)
+        try:
+            result = identify(text)
+        except Exception as e:
+            self._status.setText(f"识别出错: {type(e).__name__}")
+            self._table.setRowCount(0)
+            self._meta_box.setVisible(False)
+            return
 
         # 取出 results 列表和 meta
         results = result.results

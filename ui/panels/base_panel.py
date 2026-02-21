@@ -123,6 +123,8 @@ class BasePanel(QWidget):
             return
         try:
             result = self.process(text)
+            if result is None:
+                result = ""
             self.output_area.setPlainText(result)
             self._out_label.setText(f"{len(result)} 字符")
             self._status("处理完成")

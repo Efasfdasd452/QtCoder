@@ -144,7 +144,9 @@ class FeatureCard(QFrame):
 #  主窗口
 # ═════════════════════════════════════════════════════════════
 class MainWindow(QMainWindow):
-
+    """
+        主界面
+    """
     def __init__(self):
         super().__init__()
         self._nav_btns = []           # 侧边栏按钮

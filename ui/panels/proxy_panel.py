@@ -6,7 +6,7 @@ from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
     QPushButton, QTextEdit, QGroupBox, QComboBox, QSpinBox,
     QApplication, QTableWidget, QTableWidgetItem, QHeaderView,
-    QAbstractItemView, QProgressBar, QSplitter
+    QAbstractItemView, QProgressBar, QSplitter, QMessageBox,
 )
 from PyQt5.QtGui import QFont, QColor
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
@@ -274,6 +274,10 @@ class ProxyTestPanel(QWidget):
         return urls
 
     def _start(self):
+        if self._thread and self._thread.isRunning():
+            QMessageBox.information(
+                self, "提示", "当前测试正在进行，请等待完成或点击停止。")
+            return
         urls = self._parse_urls()
         if not urls:
             self._status.setText("请输入至少一个 URL")

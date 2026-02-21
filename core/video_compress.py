@@ -134,6 +134,7 @@ def probe_video(path: str) -> VideoInfo:
     fmt = data.get("format", {})
     info.duration = float(fmt.get("duration", 0))
 
+    video_stream_duration = None  # 当 format 无 duration 时用首条视频流时长兜底
     for s in data.get("streams", []):
         if s.get("codec_type") == "video" and not info.video_codec:
             info.video_codec = s.get("codec_name", "")
@@ -148,6 +149,16 @@ def probe_video(path: str) -> VideoInfo:
                 info.fps = round(float(n) / float(d), 3) if float(d) else 0
             except (ValueError, ZeroDivisionError):
                 pass
+            # 部分容器 format.duration 为 0，用视频流 duration 或 nb_frames 推算
+            if video_stream_duration is None:
+                try:
+                    video_stream_duration = float(s.get("duration", 0))
+                except (TypeError, ValueError):
+                    pass
+                if (video_stream_duration is None or video_stream_duration <= 0) and info.fps > 0:
+                    nb = int(s.get("nb_frames", 0))
+                    if nb > 0:
+                        video_stream_duration = nb / info.fps
         elif s.get("codec_type") == "audio" and not info.audio_codec:
             info.audio_codec = s.get("codec_name", "")
             br = s.get("bit_rate")
@@ -156,6 +167,8 @@ def probe_video(path: str) -> VideoInfo:
             info.audio_channels = int(s.get("channels", 0))
             info.audio_sample_rate = int(s.get("sample_rate", 0))
 
+    if info.duration <= 0 and video_stream_duration and video_stream_duration > 0:
+        info.duration = video_stream_duration
     if not info.video_bitrate and info.duration > 0:
         total = int(fmt.get("bit_rate", 0)) // 1000
         info.video_bitrate = max(total - info.audio_bitrate, 0)
@@ -307,11 +320,21 @@ def build_command(cfg: CompressConfig) -> list:
     if not ff:
         raise FileNotFoundError("未找到 ffmpeg")
 
-    # 要降帧时必须在输入端加 -r，否则解码仍按源帧率喂给编码器，体积不会变小
-    r_out = cfg.output_fps if cfg.output_fps > 0 else cfg.input_fps
+    # 禁止输出与输入为同一文件，否则边读边写会损坏文件
+    try:
+        if os.path.normpath(os.path.abspath(cfg.input_path)) == os.path.normpath(os.path.abspath(cfg.output_path)):
+            raise ValueError("输出路径不能与源文件相同，请另选保存位置")
+    except OSError:
+        pass  # 路径无效时交给 FFmpeg 报错
+
+    # 仅在明确指定输出帧率时才降帧；0 = 保持源帧率不变
+    r_out = cfg.output_fps if cfg.output_fps > 0 else 0.0
+    # 统一 GOP：约 2 秒一个关键帧，避免任意编码器/预设下后半段 seek 黑屏或闪退
+    fps_for_gop = r_out if r_out > 0 else (cfg.input_fps if cfg.input_fps > 0 else 30.0)
+    gop_frames = max(24, min(250, int(round(fps_for_gop * 2))))
+
     cmd = [ff, "-y", "-hide_banner"]
-    if r_out > 0 and cfg.output_fps > 0:
-        cmd += ["-r", str(round(r_out, 3))]
+    # 不在输入端加 -r：对有时间戳的视频文件，输入端 -r 会覆盖原始 PTS，导致 seek 黑屏/闪退
     cmd += ["-i", cfg.input_path]
 
     cmd += ["-c:v", cfg.vcodec]
@@ -319,17 +342,20 @@ def build_command(cfg: CompressConfig) -> list:
     vc = cfg.vcodec
     if vc in ("libx264", "libx265"):
         cmd += ["-crf", str(cfg.crf), "-preset", cfg.speed]
+        cmd += ["-g", str(gop_frames)]
     elif vc == "libaom-av1":
         cpu = {"ultrafast": "8", "superfast": "7", "veryfast": "6",
                "faster": "5", "fast": "4", "medium": "4",
                "slow": "2", "slower": "1", "veryslow": "0"}.get(cfg.speed, "4")
         cmd += ["-crf", str(cfg.crf), "-cpu-used", cpu, "-row-mt", "1"]
+        cmd += ["-g", str(gop_frames)]
     elif vc == "libvpx-vp9":
         cpu = {"ultrafast": "5", "superfast": "4", "veryfast": "3",
                "faster": "2", "fast": "2", "medium": "1",
                "slow": "1", "slower": "0", "veryslow": "0"}.get(cfg.speed, "1")
         cmd += ["-crf", str(cfg.crf), "-b:v", "0", "-cpu-used", cpu,
                 "-row-mt", "1"]
+        cmd += ["-g", str(gop_frames)]
     elif "nvenc" in vc:
         # NVENC 的 CQ 与 x265 CRF 标度不同：CQ 18 与 20 体积差异常很小，属硬件编码器特性
         preset = {"ultrafast": "p1", "superfast": "p2", "veryfast": "p3",
@@ -337,18 +363,34 @@ def build_command(cfg: CompressConfig) -> list:
                   "slow": "p6", "slower": "p7", "veryslow": "p7"
                   }.get(cfg.speed, "p5")
         cmd += ["-rc", "vbr", "-cq", str(cfg.crf), "-preset", preset]
+        # 禁用 B 帧参考（B-pyramid）：高质量预设默认开启，部分播放器 seek 时会黑屏/闪退
+        cmd += ["-b_ref_mode", "disabled"]
     elif "qsv" in vc:
         cmd += ["-global_quality", str(cfg.crf), "-preset", cfg.speed]
     elif "amf" in vc:
-        cmd += ["-rc", "vbr_latency",
+        # vbr_peak 用于文件编码；vbr_latency 为低延迟流式设计，会造成 GOP 不规则、seek 异常
+        cmd += ["-rc", "vbr_peak",
                 "-qp_i", str(cfg.crf), "-qp_p", str(cfg.crf)]
 
-    if cfg.target_width > 0:
-        cmd += ["-vf", f"scale={cfg.target_width}:-2:flags=lanczos,setsar=1"]
+    # 硬件编码器：同样用上面算好的 gop_frames，避免默认 GOP 过大导致后半段 seek 黑屏/闪退
+    if "nvenc" in vc or "qsv" in vc or "amf" in vc:
+        cmd += ["-g", str(gop_frames)]
+        if "nvenc" in vc:
+            cmd += ["-forced-idr", "1"]
 
-    # 输出端也标上帧率（降帧时已在输入端用 -r 限流，这里保证 muxer 一致）
+    # 视频滤镜：分辨率缩放 + 精确降帧（用 fps 滤镜替代 -r，PTS 更准确，seek 不黑屏）
+    vf_parts = []
+    if cfg.target_width > 0:
+        vf_parts.append(f"scale={cfg.target_width}:-2:flags=lanczos,setsar=1")
     if r_out > 0:
-        cmd += ["-r", str(round(r_out, 3))]
+        vf_parts.append(f"fps={r_out}")
+    if vf_parts:
+        cmd += ["-vf", ",".join(vf_parts)]
+
+    # 保持源帧率时仍需明确写出 -r：NVENC/AMF 等硬件编码器若无显式帧率
+    # 会把 VUI 帧率写错（常见：60fps 源输出 30fps），此处是输出端 -r，不影响 PTS
+    if r_out == 0 and cfg.input_fps > 0:
+        cmd += ["-r", str(round(cfg.input_fps, 3))]
 
     if cfg.audio_mode == "copy":
         cmd += ["-c:a", "copy"]
@@ -360,7 +402,12 @@ def build_command(cfg: CompressConfig) -> list:
 
     if cfg.output_path.lower().endswith(".mp4"):
         cmd += ["-movflags", "+faststart"]
+        # HEVC 在 MP4 中加 hvc1 标签，提升播放器兼容性（macOS/iOS/TV 及部分 Android 播放器）
+        if "hevc" in vc or "265" in vc:
+            cmd += ["-tag:v", "hvc1"]
 
+    # 避免音视频包堆积导致「Too many packets buffered」、输出截断或报错
+    cmd += ["-max_muxing_queue_size", "1024"]
     cmd.append(cfg.output_path)
     return cmd
 

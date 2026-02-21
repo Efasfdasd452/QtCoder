@@ -124,6 +124,11 @@ def compress_image(
     """
     if Image is None:
         raise RuntimeError("请安装 Pillow: pip install Pillow")
+    try:
+        if os.path.normpath(os.path.abspath(src_path)) == os.path.normpath(os.path.abspath(out_path)):
+            raise ValueError("输出路径不能与源文件相同，请另选保存位置")
+    except OSError:
+        pass
 
     p = PRESETS.get(preset_key, PRESETS["balanced"])
     jpeg_q = p["jpeg_quality"]

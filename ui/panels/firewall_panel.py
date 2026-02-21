@@ -247,8 +247,8 @@ class FirewallPanel(QWidget):
     # ── 收集参数 ──
     def _collect_rule(self) -> FwRule:
         return FwRule(
-            action=self._action.currentData(),
-            chain=self._chain.currentData(),
+            action=self._action.currentData() or "DROP",
+            chain=self._chain.currentData() or "INPUT",
             protocol=self._protocol.currentText(),
             src_ip=self._src_ip.text().strip(),
             dst_ip=self._dst_ip.text().strip(),
@@ -267,7 +267,7 @@ class FirewallPanel(QWidget):
     # ── 生成 ──
     def _generate(self):
         rule = self._collect_rule()
-        fmt = self._format.currentData()
+        fmt = self._format.currentData() or "iptables"
 
         try:
             if fmt == "all":

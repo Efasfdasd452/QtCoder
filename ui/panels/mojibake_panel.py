@@ -192,7 +192,15 @@ class MojibakePanel(QWidget):
                 "color:#cc0000; font-size:12px; padding:2px 4px;")
             return
 
-        results = detect_encoding(text)
+        try:
+            results = detect_encoding(text)
+        except Exception as e:
+            self._detect_label.setText(f"识别出错: {type(e).__name__}")
+            self._detect_label.setStyleSheet(
+                "color:#cc0000; font-size:12px; padding:2px 4px;")
+            self._status.setText(f"出错: {e}")
+            return
+
         if not results:
             self._detect_label.setText("无法识别编码")
             return
@@ -246,7 +254,15 @@ class MojibakePanel(QWidget):
         self._status.setText("正在尝试所有编码组合…")
         QApplication.processEvents()
 
-        self._results = fix_mojibake(text)
+        try:
+            self._results = fix_mojibake(text)
+        except Exception as e:
+            self._results = []
+            self._populate_table()
+            self._status.setText(f"修复出错: {type(e).__name__}")
+            self._result_count.setText("")
+            return
+
         self._populate_table()
 
         if not self._results:

@@ -262,6 +262,9 @@ class HtmlPanel(QWidget):
         indent = self._indent.value()
 
         # 小文本直接同步处理，大文本走线程
+        if self._thread and self._thread.isRunning():
+            self._status.setText("正在处理中，请稍候…")
+            return
         if len(text) < 200_000:
             try:
                 result = beautify_html(text, indent)

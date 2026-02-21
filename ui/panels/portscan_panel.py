@@ -315,15 +315,15 @@ class PortScanPanel(QWidget):
         g.addWidget(self._raw_send)
 
         r_btn = QHBoxLayout()
-        raw_btn = QPushButton("  发送探测")
-        raw_btn.setFixedHeight(34)
-        raw_btn.setStyleSheet(
+        self._raw_btn = QPushButton("  发送探测")
+        self._raw_btn.setFixedHeight(34)
+        self._raw_btn.setStyleSheet(
             "QPushButton{background:#0078d4;color:#fff;font-weight:bold;"
             "font-size:13px;border-radius:4px;padding:0 22px}"
             "QPushButton:hover{background:#106ebe}"
             "QPushButton:pressed{background:#005a9e}")
-        raw_btn.clicked.connect(self._raw_probe)
-        r_btn.addWidget(raw_btn)
+        self._raw_btn.clicked.connect(self._raw_probe)
+        r_btn.addWidget(self._raw_btn)
         r_btn.addStretch()
         g.addLayout(r_btn)
 
@@ -383,6 +383,9 @@ class PortScanPanel(QWidget):
     #  批量扫描逻辑
     # ══════════════════════════════════════════════════════════
     def _start_scan(self):
+        if self._scan_thread and self._scan_thread.isRunning():
+            self._status.setText("扫描正在进行，请等待完成或点击停止")
+            return
         host = self._host.text().strip()
         port_text = self._ports.text().strip()
         if not host:
@@ -497,6 +500,9 @@ class PortScanPanel(QWidget):
             return text.encode('utf-8').decode('unicode_escape').encode('latin-1')
 
     def _raw_probe(self):
+        if self._raw_thread and self._raw_thread.isRunning():
+            self._raw_status.setText("探测正在进行，请稍候")
+            return
         host = self._raw_host.text().strip()
         port = self._raw_port.value()
         if not host:
@@ -517,16 +523,17 @@ class PortScanPanel(QWidget):
             f"正在连接 {host}:{port} ...")
         self._raw_resp_text.clear()
         self._raw_resp_hex.clear()
+        self._raw_btn.setEnabled(False)
 
         self._raw_thread = RawProbeThread(
             host, port, send_data,
             self._raw_timeout.value(), proxy)
         self._raw_thread.finished.connect(self._on_raw_result)
-        self._raw_thread.error.connect(
-            lambda msg: self._raw_status.setText(f"错误: {msg}"))
+        self._raw_thread.error.connect(self._on_raw_error)
         self._raw_thread.start()
 
     def _on_raw_result(self, r):
+        self._raw_btn.setEnabled(True)
         if not r['connected']:
             self._raw_resp_text.setPlainText(r['error'])
             self._raw_status.setText("连接失败")
@@ -540,6 +547,10 @@ class PortScanPanel(QWidget):
             f"连接成功 | 发送 {r['sent']} 字节 | "
             f"接收 {recv_len} 字节"
             + (f" | 错误: {r['error']}" if r['error'] else ''))
+
+    def _on_raw_error(self, msg):
+        self._raw_btn.setEnabled(True)
+        self._raw_status.setText(f"错误: {msg}")
 
     # ══════════════════════════════════════════════════════════
     #  工具

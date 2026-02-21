@@ -255,7 +255,9 @@ class _BatchCompressWorker(QThread):
             if self._cancelled:
                 if self._proc and self._proc.poll() is None:
                     self._proc.kill()
-                if out and os.path.isfile(out):
+                    self._proc.wait()
+                # 仅当本文件未成功完成时才删输出，避免误删已压好的文件
+                if out and os.path.isfile(out) and (self._proc.returncode or 0) != 0:
                     try:
                         os.remove(out)
                     except OSError:
@@ -1002,17 +1004,17 @@ class VideoPanel(QWidget):
             cfg = CompressConfig(
                 input_path=self._info.path,
                 output_path=self._output_path,
-                vcodec=self._codec_combo.currentData(),
+                vcodec=self._codec_combo.currentData() or "libx265",
                 crf=self._crf_spin.value(),
-                speed=self._speed_combo.currentData(),
-                audio_mode=self._audio_combo.currentData(),
+                speed=self._speed_combo.currentData() or "medium",
+                audio_mode=self._audio_combo.currentData() or "aac_192",
             )
-            w, h = self._res_combo.currentData()
+            w, h = self._res_combo.currentData() or (0, 0)
             if w > 0 and self._info and w < self._info.width:
                 cfg.target_width = w
                 cfg.target_height = h
             ofps = self._fps_combo.currentData()
-            if ofps is not None and ofps > 0:
+            if ofps is not None and float(ofps or 0) > 0:
                 cfg.output_fps = float(ofps)
             if self._encoder_mode_combo.currentData() != "cpu_only":
                 cfg.vcodec = auto_select_encoder(cfg.vcodec, self._hw_encoders)
@@ -1033,7 +1035,26 @@ class VideoPanel(QWidget):
 
     # ── 开始 / 取消 ──────────────────────────────────────────
 
+    def _set_controls_enabled_for_run(self, enabled: bool):
+        """压缩进行中时禁用文件/输出选择及拖放，避免中途改配置造成困惑或误触。"""
+        self._open_btn.setEnabled(enabled)
+        self._open_multi_btn.setEnabled(enabled)
+        self._out_btn.setEnabled(enabled)
+        self._batch_src_btn.setEnabled(enabled)
+        self._batch_out_btn.setEnabled(enabled)
+        self._batch_recursive.setEnabled(enabled)
+        self.setAcceptDrops(enabled)
+
     def _start(self):
+        # 已有任务在跑时不允许再点开始，避免单文件/批量同时跑
+        if self._worker and self._worker.isRunning():
+            QMessageBox.information(
+                self, "提示", "当前单文件压缩正在进行，请等待完成或点击取消。")
+            return
+        if self._batch_worker and self._batch_worker.isRunning():
+            QMessageBox.information(
+                self, "提示", "当前批量压缩正在进行，请等待完成或点击取消。")
+            return
         # 根据当前标签页执行单文件或批量
         if self._tabs.currentWidget() == self._batch_tab_widget:
             self._start_batch()
@@ -1043,8 +1064,6 @@ class VideoPanel(QWidget):
             return
         if not self._info:
             QMessageBox.information(self, "提示", "请先选择视频文件")
-            return
-        if self._worker and self._worker.isRunning():
             return
 
         try:
@@ -1069,6 +1088,7 @@ class VideoPanel(QWidget):
         self._start_btn.setEnabled(False)
         self._cancel_btn.setEnabled(True)
         self._cancel_btn.setVisible(True)
+        self._set_controls_enabled_for_run(False)
         self._progress.setVisible(True)
         self._progress.setValue(0)
         self._progress_label.setVisible(True)
@@ -1118,6 +1138,7 @@ class VideoPanel(QWidget):
         self._start_btn.setEnabled(True)
         self._cancel_btn.setEnabled(False)
         self._cancel_btn.setVisible(False)
+        self._set_controls_enabled_for_run(True)
         self._progress.setVisible(False)
         self._progress_label.setVisible(False)
 
@@ -1343,7 +1364,28 @@ class VideoPanel(QWidget):
         if self._batch_worker and self._batch_worker.isRunning():
             return
         self._ensure_hw_encoders_ready()
+        is_custom = self._preset_btns["custom"].isChecked()
         preset = self._get_single_preset_key()
+        if is_custom:
+            raw_vcodec = self._codec_combo.currentData() or "libx265"
+            if self._encoder_mode_combo.currentData() != "cpu_only":
+                resolved_vcodec = auto_select_encoder(raw_vcodec, self._hw_encoders)
+            else:
+                resolved_vcodec = raw_vcodec
+            w, h = self._res_combo.currentData() or (0, 0)
+            ofps = self._fps_combo.currentData()
+            ofps = float(ofps) if ofps is not None else 0.0
+            custom_params = {
+                "vcodec": resolved_vcodec,
+                "crf": self._crf_spin.value(),
+                "speed": self._speed_combo.currentData() or "medium",
+                "audio_mode": self._audio_combo.currentData() or "aac_192",
+                "target_width": w,
+                "target_height": h if w else 0,
+                "output_fps": ofps,
+            }
+        else:
+            custom_params = None
         out_dir = os.path.normpath(self._multi_output_dir)
         tasks = []
         used = {}
@@ -1357,13 +1399,17 @@ class VideoPanel(QWidget):
                 used[key] = 1
                 out_name = key
             out_path = os.path.join(out_dir, out_name)
-            tasks.append((path, out_path, preset))
+            if custom_params:
+                tasks.append((path, out_path, "custom", custom_params))
+            else:
+                tasks.append((path, out_path, preset))
         self._log_area.clear()
         self._log_area.setVisible(True)
         self._log_btn.setText("隐藏日志 ▴")
         self._start_btn.setEnabled(False)
         self._cancel_btn.setEnabled(True)
         self._cancel_btn.setVisible(True)
+        self._set_controls_enabled_for_run(False)
         self._progress.setVisible(True)
         self._progress.setValue(0)
         self._progress_label.setVisible(True)
@@ -1380,7 +1426,12 @@ class VideoPanel(QWidget):
 
     def _start_batch(self):
         if not self._batch_videos:
-            QMessageBox.information(self, "提示", "请先选择源文件夹")
+            if not self._batch_source_dir or not os.path.isdir(self._batch_source_dir):
+                QMessageBox.information(self, "提示", "请先选择源文件夹")
+            else:
+                QMessageBox.information(
+                    self, "提示",
+                    "当前源文件夹内未找到视频文件。\n请更换文件夹或勾选「包含子文件夹（递归）」后再试。")
             return
         if not self._batch_output_dir or not os.path.isdir(self._batch_output_dir):
             QMessageBox.information(self, "提示", "请先选择输出文件夹")
@@ -1395,11 +1446,11 @@ class VideoPanel(QWidget):
         if self._batch_mode_unified.isChecked():
             preset_key = self._batch_unified_preset.currentData()
             if preset_key == "custom":
-                w, h = self._batch_res_combo.currentData()
+                wh = self._batch_res_combo.currentData() or (0, 0)
+                w, h = wh if isinstance(wh, (tuple, list)) and len(wh) >= 2 else (0, 0)
                 ofps = self._batch_fps_combo.currentData()
-                if ofps is None:
-                    ofps = 0.0
-                raw_vcodec = self._batch_codec_combo.currentData()
+                ofps = float(ofps) if ofps is not None else 0.0
+                raw_vcodec = self._batch_codec_combo.currentData() or "libx265"
                 if self._encoder_mode_combo.currentData() == "cpu_only":
                     resolved_vcodec = raw_vcodec
                 else:
@@ -1407,11 +1458,11 @@ class VideoPanel(QWidget):
                 base_custom = {
                     "vcodec": resolved_vcodec,
                     "crf": self._batch_crf_spin.value(),
-                    "speed": self._batch_speed_combo.currentData(),
-                    "audio_mode": self._batch_audio_combo.currentData(),
+                    "speed": self._batch_speed_combo.currentData() or "medium",
+                    "audio_mode": self._batch_audio_combo.currentData() or "aac_192",
                     "target_width": w if w else 0,
                     "target_height": h if w else 0,
-                    "output_fps": float(ofps),
+                    "output_fps": ofps,
                 }
             elif preset_key in PRESETS:
                 # 与单文件同一套逻辑：先 from_preset 再 auto_select_encoder，保证同视频同参数同体积
@@ -1445,7 +1496,7 @@ class VideoPanel(QWidget):
                     tasks.append((path, out_path, self._batch_unified_preset.currentData()))
             else:
                 combo = self._batch_table.cellWidget(i, 1)
-                preset_key = combo.currentData() if combo else "balanced"
+                preset_key = (combo.currentData() if combo else None) or "balanced"
                 tasks.append((path, out_path, preset_key))
         self._log_area.clear()
         self._log_area.setVisible(True)
@@ -1453,6 +1504,7 @@ class VideoPanel(QWidget):
         self._start_btn.setEnabled(False)
         self._cancel_btn.setEnabled(True)
         self._cancel_btn.setVisible(True)
+        self._set_controls_enabled_for_run(False)
         self._progress.setVisible(True)
         self._progress.setValue(0)
         self._progress_label.setVisible(True)
@@ -1477,6 +1529,7 @@ class VideoPanel(QWidget):
         self._start_btn.setEnabled(True)
         self._cancel_btn.setEnabled(False)
         self._cancel_btn.setVisible(False)
+        self._set_controls_enabled_for_run(True)
         self._progress.setVisible(False)
         self._progress_label.setVisible(False)
         self._output_path = self._multi_output_dir or self._batch_output_dir  # 便于“打开输出文件夹”
