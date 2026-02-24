@@ -6,3 +6,4 @@
 /vendor/
 /linux_ffmpeg/
 __pycache__/
+/bin/

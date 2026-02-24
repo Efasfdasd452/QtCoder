@@ -29,17 +29,33 @@ from .panels.ssh_panel     import SshPanel
 from .panels.regex_panel   import RegexPanel
 from .panels.diff_panel    import DiffPanel
 from .panels.json_panel    import JsonPanel
+from .panels.json_cpp_panel    import JsonCppPanel
+from .panels.json_java_panel   import JsonJavaPanel
+from .panels.json_python_panel import JsonPythonPanel
+from .panels.json_php_panel    import JsonPhpPanel
+from .panels.json_js_panel     import JsonJsPanel
+from .panels.line_big_panel    import LineBigPanel
 from .panels.zhconv_panel  import ZhconvPanel
 from .panels.mojibake_panel  import MojibakePanel
 from .panels.portscan_panel  import PortScanPanel
 from .panels.proxy_panel     import ProxyTestPanel
 from .panels.html_panel      import HtmlPanel
 from .panels.openssl_panel   import OpensslPanel
+from .panels.selfcert_panel  import SelfCertPanel
 from .panels.identifier_panel import IdentifierPanel
 from .panels.watermark_panel  import WatermarkPanel
 from .panels.firewall_panel   import FirewallPanel
-from .panels.video_panel      import VideoPanel
-from .panels.image_panel      import ImagePanel
+from .panels.video_panel       import VideoPanel
+from .panels.image_panel       import ImagePanel
+from .panels.torrent_magnet_panel import TorrentMagnetPanel
+from .panels.stroke_panel          import StrokePanel
+from .panels.b64image_panel        import B64ImagePanel
+from .panels.timezone_panel        import TimezonePanel
+from .panels.filehash_panel        import FileHashPanel
+from .panels.url_parser_panel      import UrlParserPanel
+from .panels.jwt_panel             import JwtPanel
+from .panels.cookie_panel          import CookiePanel
+from .panels.config_convert_panel  import ConfigConvertPanel
 
 # ── 功能注册表 ───────────────────────────────────────────────
 # (分类名, 分类色, [(显示名, 简介, Panel类), ...])
@@ -50,6 +66,8 @@ FEATURES = [
         ("HTML 美化",     "HTML 代码格式化，XPath / 正则搜索",      HtmlPanel),
         ("简繁转换",      "中文简体繁体互转，支持台湾/香港变体",       ZhconvPanel),
         ("乱码修复",      "自动检测编码组合，一键修复乱码文本",       MojibakePanel),
+        ("汉字笔画",      "输入汉字文本，统计每个字的笔画数及总笔画",  StrokePanel),
+        ("Base64→图片",   "将 Base64 字符串批量解码并保存为图片文件",   B64ImagePanel),
     ]),
     ("加密安全", "#107c10", [
         ("加密 / 解密",   "AES、3DES、ChaCha20、Salsa20 等 11 种算法", CryptoPanel),
@@ -57,10 +75,23 @@ FEATURES = [
         ("密文识别",      "根据特征识别加密/哈希算法 (MD5, bcrypt, JWT ...)", IdentifierPanel),
         ("SSH 密钥",      "生成 RSA / Ed25519 / ECDSA 密钥对并导出",  SshPanel),
         ("OpenSSL 密钥",  "非对称密钥对生成 (PEM/DER/OpenSSH 导出)",   OpensslPanel),
+        ("自签名证书",    "生成网站 HTTPS 自签名证书 (含 SAN, nginx/Apache 可用)", SelfCertPanel),
         ("UUID 生成",     "UUID v1/v3/v4/v5 批量生成，多种格式",       UuidPanel),
     ]),
     ("开发辅助", "#ca5010", [
+        ("时区转换",      "世界时钟实时展示 + Unix 时间戳 ↔ 格式化时间互转", TimezonePanel),
+        ("JWT 解析",      "解码 JWT Token Header/Payload，检查过期时间，纯本地",  JwtPanel),
+        ("Cookie 解析",   "解析 Cookie 请求头 / Set-Cookie 响应头，生成 requests 代码", CookiePanel),
+        ("URL 解析",      "解析复杂 URL 查询参数，可编辑，一键生成 Python requests 代码", UrlParserPanel),
+        ("配置格式转换",  "JSON / YAML / TOML 三种配置文件格式双向互转", ConfigConvertPanel),
+        ("文件哈希",      "拖放文件/文件夹批量计算 MD5/SHA-1/SHA-256/SHA-512，支持哈希验证", FileHashPanel),
         ("cURL 转换",     "cURL 命令转换为 Python / Go / Java 等代码", CurlPanel),
+        ("JSON 转 C++",   "将 JSON 结构转换为 C++ 类定义（含嵌套类）", JsonCppPanel),
+        ("JSON 转 Java",  "将 JSON 结构转换为 Java 类定义（含 List、嵌套类）", JsonJavaPanel),
+        ("JSON 转 Python","将 JSON 结构转换为 Python dataclass 定义", JsonPythonPanel),
+        ("JSON 转 PHP",   "将 JSON 结构转换为 PHP 类定义（类型属性）", JsonPhpPanel),
+        ("JSON 转 JS/TS", "将 JSON 结构转换为 TypeScript interface 定义", JsonJsPanel),
+        ("下划线↔驼峰",   "下划线命名与驼峰命名互转（snake_case ↔ camelCase）", LineBigPanel),
         ("正则测试",      "正则表达式实时匹配测试与高亮显示",           RegexPanel),
         ("字符串比对",    "两段文本逐行 / 逐字符差异高亮对比",          DiffPanel),
     ]),
@@ -68,6 +99,7 @@ FEATURES = [
         ("端口扫描",      "TCP 端口开放检测与服务协议自动识别",         PortScanPanel),
         ("代理测试",      "HTTP / SOCKS5 代理批量测试 URL 可达性",     ProxyTestPanel),
         ("防火墙规则",    "iptables/ufw/firewalld/nftables/netsh 规则生成", FirewallPanel),
+        ("种子↔磁力",     "种子转磁力（纯本地）/ 磁力转种子（需联网，指定输出文件夹）",  TorrentMagnetPanel),
     ]),
     ("媒体工具", "#e74856", [
         ("水印检测",      "隐藏水印检测/嵌入/提取 (blind_watermark + 多维度分析)", WatermarkPanel),

@@ -1,72 +1,153 @@
 # -*- coding: utf-8 -*-
-"""端口扫描 & 服务探测面板 — 支持 SOCKS5/HTTP 代理、服务预设、Raw TCP 探测"""
+"""端口扫描面板 — 基于 nmap + Raw TCP/UDP 探测"""
+
+import subprocess
 
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
-    QPushButton, QTextEdit, QGroupBox, QSpinBox, QApplication,
+    QPushButton, QGroupBox, QSpinBox, QApplication,
     QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
     QProgressBar, QComboBox, QCheckBox, QTabWidget, QPlainTextEdit,
+    QSizePolicy, QFrame,
 )
 from PyQt5.QtGui import QFont, QColor
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 
 from core.port_scanner import (
-    check_port, parse_ports, raw_tcp_probe,
-    COMMON_PORTS, WELL_KNOWN_PORTS,
-    SERVICE_PRESETS, SERVICE_PRESET_NAMES,
+    parse_ports, raw_tcp_probe, raw_udp_probe,
+    parse_nmap_xml, build_nmap_cmd,
+    WELL_KNOWN_PORTS, SERVICE_PRESETS, SERVICE_PRESET_NAMES,
+    SCAN_TYPE_NAMES, SCAN_TYPE_FLAGS, TIMING_NAMES,
+)
+from core.nmap_finder import (
+    is_nmap_available, download_nmap,
+    NMAP_ZIP_URL, NMAP_VERSION, NMAP_BIN_DIR,
 )
 
 
-# ── 后台扫描线程 ─────────────────────────────────────────────
-class ScanThread(QThread):
-    result_ready = pyqtSignal(dict)
-    progress = pyqtSignal(int, int)
-    finished_all = pyqtSignal()
-    error = pyqtSignal(str)
+_BTN_PRIMARY = (
+    "QPushButton{background:#0078d4;color:#fff;font-weight:bold;"
+    "font-size:13px;border-radius:4px;padding:0 22px}"
+    "QPushButton:hover{background:#106ebe}"
+    "QPushButton:pressed{background:#005a9e}")
 
-    def __init__(self, host, ports, timeout, proxy=None):
-        super().__init__()
-        self.host = host
-        self.ports = ports
-        self.timeout = timeout
-        self.proxy = proxy
-        self._stop = False
-
-    def stop(self):
-        self._stop = True
-
-    def run(self):
-        total = len(self.ports)
-        for i, port in enumerate(self.ports):
-            if self._stop:
-                break
-            try:
-                r = check_port(self.host, port, self.timeout, self.proxy)
-                self.result_ready.emit(r)
-            except Exception as e:
-                self.error.emit(f"端口 {port}: {e}")
-            self.progress.emit(i + 1, total)
-        self.finished_all.emit()
+_BTN_PLAIN = (
+    "QPushButton{border:1px solid #dfe2e8;border-radius:4px;"
+    "padding:0 14px;background:#fff;color:#1e2433;font-size:12px}"
+    "QPushButton:hover{background:#f0f2f5}")
 
 
-# ── Raw TCP 探测线程 ──────────────────────────────────────────
-class RawProbeThread(QThread):
-    finished = pyqtSignal(dict)
-    error = pyqtSignal(str)
-
-    def __init__(self, host, port, send_data, timeout, proxy=None):
-        super().__init__()
-        self.host = host
-        self.port = port
-        self.send_data = send_data
-        self.timeout = timeout
-        self.proxy = proxy
+# ── nmap 下载线程 ─────────────────────────────────────────────
+class NmapDownloadThread(QThread):
+    progress   = pyqtSignal(int, int)   # (downloaded_bytes, total_bytes)
+    finished   = pyqtSignal(str)        # nmap_exe_path
+    error      = pyqtSignal(str)
 
     def run(self):
         try:
-            r = raw_tcp_probe(
-                self.host, self.port, self.send_data,
-                self.timeout, self.proxy)
+            path = download_nmap(
+                progress_cb=lambda d, t: self.progress.emit(d, t))
+            self.finished.emit(path)
+        except Exception as e:
+            self.error.emit(str(e))
+
+
+# ── nmap 扫描线程 ─────────────────────────────────────────────
+class NmapScanThread(QThread):
+    scan_done  = pyqtSignal(list, str)   # (results, cmd_str)
+    scan_error = pyqtSignal(str)
+
+    def __init__(self, host, ports, scan_flags, service_detect,
+                 os_detect, script, timing, timeout):
+        super().__init__()
+        self._host           = host
+        self._ports          = ports
+        self._scan_flags     = scan_flags
+        self._service_detect = service_detect
+        self._os_detect      = os_detect
+        self._script         = script
+        self._timing         = timing
+        self._timeout        = timeout
+        self._proc           = None
+
+    def stop(self):
+        if self._proc and self._proc.poll() is None:
+            try:
+                self._proc.kill()
+            except Exception:
+                pass
+
+    def run(self):
+        cmd = build_nmap_cmd(
+            self._host, self._ports, self._scan_flags,
+            self._service_detect, self._os_detect,
+            self._script, self._timing,
+        )
+        cmd_str = ' '.join(cmd)
+        try:
+            self._proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            stdout, stderr = self._proc.communicate(timeout=self._timeout)
+            if self._proc.returncode not in (0, 1):
+                err = stderr.decode('utf-8', errors='replace')
+                self.scan_error.emit(
+                    f"nmap 错误 (exit {self._proc.returncode}):\n{err}")
+                return
+            results = parse_nmap_xml(stdout.decode('utf-8', errors='replace'))
+            self.scan_done.emit(results, cmd_str)
+        except subprocess.TimeoutExpired:
+            if self._proc:
+                self._proc.kill()
+            self.scan_error.emit(f"nmap 扫描超时 ({self._timeout}秒)")
+        except FileNotFoundError:
+            self.scan_error.emit(
+                "找不到 nmap，请先安装 nmap。\n"
+                "下载地址: https://nmap.org/download")
+        except Exception as e:
+            self.scan_error.emit(str(e))
+
+
+# ── Raw TCP 探测线程 ──────────────────────────────────────────
+class RawTcpThread(QThread):
+    finished = pyqtSignal(dict)
+    error    = pyqtSignal(str)
+
+    def __init__(self, host, port, send_data, timeout, proxy=None):
+        super().__init__()
+        self.host      = host
+        self.port      = port
+        self.send_data = send_data
+        self.timeout   = timeout
+        self.proxy     = proxy
+
+    def run(self):
+        try:
+            r = raw_tcp_probe(self.host, self.port, self.send_data,
+                              self.timeout, self.proxy)
+            self.finished.emit(r)
+        except Exception as e:
+            self.error.emit(str(e))
+
+
+# ── Raw UDP 探测线程 ──────────────────────────────────────────
+class RawUdpThread(QThread):
+    finished = pyqtSignal(dict)
+    error    = pyqtSignal(str)
+
+    def __init__(self, host, port, send_data, timeout):
+        super().__init__()
+        self.host      = host
+        self.port      = port
+        self.send_data = send_data
+        self.timeout   = timeout
+
+    def run(self):
+        try:
+            r = raw_udp_probe(self.host, self.port, self.send_data,
+                              self.timeout)
             self.finished.emit(r)
         except Exception as e:
             self.error.emit(str(e))
@@ -80,8 +161,10 @@ class PortScanPanel(QWidget):
         super().__init__(parent)
         self._mono = QFont("Consolas", 10)
         self._mono.setStyleHint(QFont.Monospace)
-        self._scan_thread = None
-        self._raw_thread = None
+        self._scan_thread     = None
+        self._raw_tcp_thread  = None
+        self._raw_udp_thread  = None
+        self._download_thread = None
         self._build_ui()
 
     def _build_ui(self):
@@ -89,14 +172,14 @@ class PortScanPanel(QWidget):
         root.setContentsMargins(10, 8, 10, 6)
         root.setSpacing(6)
 
-        # 用 Tab 区分 "批量扫描" 和 "Raw TCP 探测"
         tabs = QTabWidget()
-        tabs.addTab(self._build_scan_tab(), "批量端口扫描")
-        tabs.addTab(self._build_raw_tab(),  "Raw TCP 探测")
+        tabs.addTab(self._build_scan_tab(),    "nmap 端口扫描")
+        tabs.addTab(self._build_raw_tcp_tab(), "Raw TCP 探测")
+        tabs.addTab(self._build_raw_udp_tab(), "Raw UDP 探测")
         root.addWidget(tabs)
 
     # ══════════════════════════════════════════════════════════
-    #  Tab 1: 批量扫描
+    #  Tab 1: nmap 批量扫描
     # ══════════════════════════════════════════════════════════
     def _build_scan_tab(self):
         w = QWidget()
@@ -104,102 +187,133 @@ class PortScanPanel(QWidget):
         layout.setContentsMargins(6, 6, 6, 6)
         layout.setSpacing(6)
 
-        # ── 参数区 ────────────────────────────────────────────
-        group = QGroupBox("扫描参数")
-        g = QVBoxLayout(group)
+        # ── nmap 状态横幅 ─────────────────────────────────────
+        self._nmap_banner = QFrame()
+        self._nmap_banner.setStyleSheet(
+            "QFrame{background:#fff3cd;border:1px solid #ffc107;"
+            "border-radius:4px;padding:2px;}")
+        banner_row = QHBoxLayout(self._nmap_banner)
+        banner_row.setContentsMargins(8, 4, 8, 4)
+        self._nmap_banner_lbl = QLabel(
+            f"nmap 未找到 — 需要下载 nmap {NMAP_VERSION} 才能使用扫描功能")
+        self._nmap_banner_lbl.setStyleSheet("color:#856404;font-size:11px;")
+        banner_row.addWidget(self._nmap_banner_lbl, stretch=1)
 
-        # 主机
+        self._dl_btn = QPushButton(f"⬇ 下载 nmap {NMAP_VERSION}")
+        self._dl_btn.setFixedHeight(26)
+        self._dl_btn.setStyleSheet(
+            "QPushButton{background:#ffc107;color:#333;border-radius:3px;"
+            "padding:0 10px;font-size:12px;font-weight:bold;}"
+            "QPushButton:hover{background:#ffca2c}"
+            "QPushButton:disabled{background:#e0c060;color:#888}")
+        self._dl_btn.clicked.connect(self._start_download)
+        banner_row.addWidget(self._dl_btn)
+
+        self._dl_progress = QProgressBar()
+        self._dl_progress.setFixedHeight(18)
+        self._dl_progress.setFixedWidth(160)
+        self._dl_progress.setVisible(False)
+        banner_row.addWidget(self._dl_progress)
+
+        layout.addWidget(self._nmap_banner)
+        self._nmap_banner.setVisible(not is_nmap_available())
+
+        # ── 基础参数 ──────────────────────────────────────────
+        param_group = QGroupBox("扫描参数")
+        pg = QVBoxLayout(param_group)
+
         r1 = QHBoxLayout()
         r1.addWidget(QLabel("主机:"))
         self._host = QLineEdit("127.0.0.1")
         self._host.setPlaceholderText("IP 或域名")
         r1.addWidget(self._host, stretch=1)
-        g.addLayout(r1)
+        pg.addLayout(r1)
 
-        # 端口 + 服务预设
         r2 = QHBoxLayout()
         r2.addWidget(QLabel("端口:"))
         self._ports = QLineEdit("22,80,443,3306,6379,8080")
         self._ports.setPlaceholderText("80 / 80-90 / 22,80,443")
         r2.addWidget(self._ports, stretch=1)
-
         self._preset = QComboBox()
         self._preset.addItems(SERVICE_PRESET_NAMES)
         self._preset.setFixedWidth(160)
         self._preset.currentIndexChanged.connect(self._on_preset)
         r2.addWidget(self._preset)
-        g.addLayout(r2)
+        pg.addLayout(r2)
 
-        # 超时
-        r3 = QHBoxLayout()
-        r3.addWidget(QLabel("超时:"))
+        layout.addWidget(param_group)
+
+        # ── nmap 选项 ─────────────────────────────────────────
+        opt_group = QGroupBox("nmap 选项")
+        og = QVBoxLayout(opt_group)
+
+        o1 = QHBoxLayout()
+        o1.addWidget(QLabel("扫描类型:"))
+        self._scan_type = QComboBox()
+        self._scan_type.addItems(SCAN_TYPE_NAMES)
+        self._scan_type.setFixedWidth(280)
+        o1.addWidget(self._scan_type)
+        o1.addSpacing(16)
+        o1.addWidget(QLabel("时序:"))
+        self._timing = QComboBox()
+        self._timing.addItems(TIMING_NAMES)
+        self._timing.setCurrentIndex(4)     # -T4
+        self._timing.setFixedWidth(180)
+        o1.addWidget(self._timing)
+        o1.addSpacing(16)
+        o1.addWidget(QLabel("超时:"))
         self._timeout = QSpinBox()
-        self._timeout.setRange(1, 30)
-        self._timeout.setValue(3)
+        self._timeout.setRange(10, 3600)
+        self._timeout.setValue(120)
         self._timeout.setSuffix(" 秒")
-        self._timeout.setFixedWidth(80)
-        r3.addWidget(self._timeout)
-        r3.addStretch()
-        g.addLayout(r3)
+        self._timeout.setFixedWidth(90)
+        o1.addWidget(self._timeout)
+        o1.addStretch()
+        og.addLayout(o1)
 
-        layout.addWidget(group)
+        o2 = QHBoxLayout()
+        self._svc_detect = QCheckBox("服务版本检测 (-sV)")
+        self._os_detect  = QCheckBox("OS 检测 (-O)  [需 root/Npcap]")
+        self._script     = QCheckBox("默认脚本 (-sC)")
+        o2.addWidget(self._svc_detect)
+        o2.addSpacing(12)
+        o2.addWidget(self._os_detect)
+        o2.addSpacing(12)
+        o2.addWidget(self._script)
+        o2.addStretch()
+        og.addLayout(o2)
 
-        # ── 代理设置 ──────────────────────────────────────────
-        proxy_group = QGroupBox("代理设置（可选）")
-        pg = QVBoxLayout(proxy_group)
+        # nmap 命令预览
+        o3 = QHBoxLayout()
+        o3.addWidget(QLabel("命令预览:"))
+        self._cmd_preview = QLineEdit()
+        self._cmd_preview.setReadOnly(True)
+        self._cmd_preview.setFont(self._mono)
+        self._cmd_preview.setStyleSheet("background:#f5f6fa;color:#333;")
+        o3.addWidget(self._cmd_preview, stretch=1)
+        og.addLayout(o3)
 
-        pr1 = QHBoxLayout()
-        self._proxy_enable = QCheckBox("通过代理扫描")
-        pr1.addWidget(self._proxy_enable)
-        pr1.addStretch()
-        pr1.addWidget(QLabel("类型:"))
-        self._proxy_type = QComboBox()
-        self._proxy_type.addItems(["SOCKS5", "HTTP"])
-        self._proxy_type.setFixedWidth(100)
-        pr1.addWidget(self._proxy_type)
-        pg.addLayout(pr1)
+        # 当选项改变时刷新命令预览
+        self._host.textChanged.connect(self._refresh_cmd_preview)
+        self._ports.textChanged.connect(self._refresh_cmd_preview)
+        self._scan_type.currentIndexChanged.connect(self._refresh_cmd_preview)
+        self._timing.currentIndexChanged.connect(self._refresh_cmd_preview)
+        self._svc_detect.stateChanged.connect(self._refresh_cmd_preview)
+        self._os_detect.stateChanged.connect(self._refresh_cmd_preview)
+        self._script.stateChanged.connect(self._refresh_cmd_preview)
+        self._refresh_cmd_preview()
 
-        pr2 = QHBoxLayout()
-        pr2.addWidget(QLabel("地址:"))
-        self._proxy_host = QLineEdit("127.0.0.1")
-        self._proxy_host.setFixedWidth(180)
-        pr2.addWidget(self._proxy_host)
-        pr2.addWidget(QLabel("端口:"))
-        self._proxy_port = QSpinBox()
-        self._proxy_port.setRange(1, 65535)
-        self._proxy_port.setValue(1080)
-        self._proxy_port.setFixedWidth(90)
-        pr2.addWidget(self._proxy_port)
-        pr2.addSpacing(12)
-        pr2.addWidget(QLabel("用户:"))
-        self._proxy_user = QLineEdit()
-        self._proxy_user.setPlaceholderText("可选")
-        self._proxy_user.setFixedWidth(100)
-        pr2.addWidget(self._proxy_user)
-        pr2.addWidget(QLabel("密码:"))
-        self._proxy_pass = QLineEdit()
-        self._proxy_pass.setEchoMode(QLineEdit.Password)
-        self._proxy_pass.setPlaceholderText("可选")
-        self._proxy_pass.setFixedWidth(100)
-        pr2.addWidget(self._proxy_pass)
-        pr2.addStretch()
-        pg.addLayout(pr2)
-
-        layout.addWidget(proxy_group)
+        layout.addWidget(opt_group)
 
         # ── 按钮行 ────────────────────────────────────────────
         btn_row = QHBoxLayout()
-        self._scan_btn = QPushButton("  开始扫描")
+        self._scan_btn = QPushButton("▶  开始扫描")
         self._scan_btn.setFixedHeight(34)
-        self._scan_btn.setStyleSheet(
-            "QPushButton{background:#0078d4;color:#fff;font-weight:bold;"
-            "font-size:13px;border-radius:4px;padding:0 22px}"
-            "QPushButton:hover{background:#106ebe}"
-            "QPushButton:pressed{background:#005a9e}")
+        self._scan_btn.setStyleSheet(_BTN_PRIMARY)
         self._scan_btn.clicked.connect(self._start_scan)
         btn_row.addWidget(self._scan_btn)
 
-        self._stop_btn = QPushButton("停止")
+        self._stop_btn = QPushButton("■ 停止")
         self._stop_btn.setFixedHeight(30)
         self._stop_btn.setEnabled(False)
         self._stop_btn.clicked.connect(self._stop_scan)
@@ -207,41 +321,46 @@ class PortScanPanel(QWidget):
 
         self._clear_btn = QPushButton("清空")
         self._clear_btn.setFixedHeight(30)
+        self._clear_btn.setStyleSheet(_BTN_PLAIN)
         self._clear_btn.clicked.connect(self._clear)
         btn_row.addWidget(self._clear_btn)
         btn_row.addStretch()
+
+        self._result_label = QLabel("")
+        btn_row.addWidget(self._result_label)
+
+        copy_btn = QPushButton("复制结果")
+        copy_btn.setFixedWidth(90)
+        copy_btn.setStyleSheet(_BTN_PLAIN)
+        copy_btn.clicked.connect(self._copy_results)
+        btn_row.addWidget(copy_btn)
         layout.addLayout(btn_row)
 
         # ── 进度条 ────────────────────────────────────────────
         self._progress = QProgressBar()
         self._progress.setFixedHeight(18)
+        self._progress.setRange(0, 0)   # 不定式
         self._progress.setVisible(False)
         layout.addWidget(self._progress)
 
         # ── 结果表格 ──────────────────────────────────────────
-        hdr = QHBoxLayout()
-        hdr.addWidget(QLabel("扫描结果:"))
-        hdr.addStretch()
-        self._result_label = QLabel("")
-        hdr.addWidget(self._result_label)
-        copy_btn = QPushButton("复制结果")
-        copy_btn.setFixedWidth(90)
-        copy_btn.clicked.connect(self._copy_results)
-        hdr.addWidget(copy_btn)
-        layout.addLayout(hdr)
-
-        self._table = QTableWidget(0, 5)
+        self._table = QTableWidget(0, 7)
         self._table.setHorizontalHeaderLabels(
-            ["端口", "状态", "服务", "详情 / Banner", "知名服务"])
-        self._table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Fixed)
-        self._table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Fixed)
-        self._table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Interactive)
-        self._table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
-        self._table.horizontalHeader().setSectionResizeMode(4, QHeaderView.Fixed)
+            ["端口", "协议", "状态", "原因", "服务", "版本", "知名服务"])
+        h = self._table.horizontalHeader()
+        h.setSectionResizeMode(0, QHeaderView.Fixed)
+        h.setSectionResizeMode(1, QHeaderView.Fixed)
+        h.setSectionResizeMode(2, QHeaderView.Fixed)
+        h.setSectionResizeMode(3, QHeaderView.Fixed)
+        h.setSectionResizeMode(4, QHeaderView.Interactive)
+        h.setSectionResizeMode(5, QHeaderView.Stretch)
+        h.setSectionResizeMode(6, QHeaderView.Fixed)
         self._table.setColumnWidth(0, 65)
-        self._table.setColumnWidth(1, 60)
-        self._table.setColumnWidth(2, 170)
-        self._table.setColumnWidth(4, 100)
+        self._table.setColumnWidth(1, 55)
+        self._table.setColumnWidth(2, 80)
+        self._table.setColumnWidth(3, 100)
+        self._table.setColumnWidth(4, 120)
+        self._table.setColumnWidth(6, 120)
         self._table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self._table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self._table.verticalHeader().setDefaultSectionSize(26)
@@ -258,7 +377,7 @@ class PortScanPanel(QWidget):
     # ══════════════════════════════════════════════════════════
     #  Tab 2: Raw TCP 探测
     # ══════════════════════════════════════════════════════════
-    def _build_raw_tab(self):
+    def _build_raw_tcp_tab(self):
         w = QWidget()
         layout = QVBoxLayout(w)
         layout.setContentsMargins(6, 6, 6, 6)
@@ -269,104 +388,171 @@ class PortScanPanel(QWidget):
 
         r1 = QHBoxLayout()
         r1.addWidget(QLabel("主机:"))
-        self._raw_host = QLineEdit("127.0.0.1")
-        self._raw_host.setFixedWidth(200)
-        r1.addWidget(self._raw_host)
+        self._tcp_host = QLineEdit("127.0.0.1")
+        self._tcp_host.setFixedWidth(200)
+        r1.addWidget(self._tcp_host)
         r1.addWidget(QLabel("端口:"))
-        self._raw_port = QSpinBox()
-        self._raw_port.setRange(1, 65535)
-        self._raw_port.setValue(8888)
-        self._raw_port.setFixedWidth(90)
-        r1.addWidget(self._raw_port)
+        self._tcp_port = QSpinBox()
+        self._tcp_port.setRange(1, 65535)
+        self._tcp_port.setValue(8888)
+        self._tcp_port.setFixedWidth(90)
+        r1.addWidget(self._tcp_port)
         r1.addWidget(QLabel("超时:"))
-        self._raw_timeout = QSpinBox()
-        self._raw_timeout.setRange(1, 30)
-        self._raw_timeout.setValue(5)
-        self._raw_timeout.setSuffix(" 秒")
-        self._raw_timeout.setFixedWidth(80)
-        r1.addWidget(self._raw_timeout)
+        self._tcp_timeout = QSpinBox()
+        self._tcp_timeout.setRange(1, 60)
+        self._tcp_timeout.setValue(5)
+        self._tcp_timeout.setSuffix(" 秒")
+        self._tcp_timeout.setFixedWidth(80)
+        r1.addWidget(self._tcp_timeout)
         r1.addStretch()
         g.addLayout(r1)
-
-        r_proxy = QHBoxLayout()
-        self._raw_proxy_enable = QCheckBox("通过代理")
-        r_proxy.addWidget(self._raw_proxy_enable)
-        r_proxy.addWidget(QLabel("(使用上方批量扫描 Tab 中设置的代理)"))
-        r_proxy.addStretch()
-        g.addLayout(r_proxy)
 
         g.addWidget(QLabel("发送数据（留空则只接收 Banner）:"))
 
         r_fmt = QHBoxLayout()
-        self._raw_fmt = QComboBox()
-        self._raw_fmt.addItems(["UTF-8 文本", "Hex 字节", "原始转义 (\\r\\n)"])
-        self._raw_fmt.setFixedWidth(160)
-        r_fmt.addWidget(self._raw_fmt)
+        self._tcp_fmt = QComboBox()
+        self._tcp_fmt.addItems(["UTF-8 文本", "Hex 字节", r"原始转义 (\r\n)"])
+        self._tcp_fmt.setFixedWidth(160)
+        r_fmt.addWidget(self._tcp_fmt)
         r_fmt.addStretch()
         g.addLayout(r_fmt)
 
-        self._raw_send = QPlainTextEdit()
-        self._raw_send.setFont(self._mono)
-        self._raw_send.setPlaceholderText(
+        self._tcp_send = QPlainTextEdit()
+        self._tcp_send.setFont(self._mono)
+        self._tcp_send.setPlaceholderText(
             "示例 (UTF-8):  GET / HTTP/1.1\\r\\nHost: 127.0.0.1\\r\\n\\r\\n\n"
             "示例 (Hex):    05 01 00\n"
             "留空: 仅连接并接收服务端主动发送的数据")
-        self._raw_send.setMaximumHeight(90)
-        g.addWidget(self._raw_send)
+        self._tcp_send.setMaximumHeight(90)
+        g.addWidget(self._tcp_send)
 
         r_btn = QHBoxLayout()
-        self._raw_btn = QPushButton("  发送探测")
-        self._raw_btn.setFixedHeight(34)
-        self._raw_btn.setStyleSheet(
-            "QPushButton{background:#0078d4;color:#fff;font-weight:bold;"
-            "font-size:13px;border-radius:4px;padding:0 22px}"
-            "QPushButton:hover{background:#106ebe}"
-            "QPushButton:pressed{background:#005a9e}")
-        self._raw_btn.clicked.connect(self._raw_probe)
-        r_btn.addWidget(self._raw_btn)
+        self._tcp_btn = QPushButton("▶  发送探测")
+        self._tcp_btn.setFixedHeight(34)
+        self._tcp_btn.setStyleSheet(_BTN_PRIMARY)
+        self._tcp_btn.clicked.connect(self._tcp_probe)
+        r_btn.addWidget(self._tcp_btn)
         r_btn.addStretch()
         g.addLayout(r_btn)
 
         layout.addWidget(group)
 
-        # 响应区
         layout.addWidget(QLabel("响应数据:"))
-
         resp_tabs = QTabWidget()
-        self._raw_resp_text = QPlainTextEdit()
-        self._raw_resp_text.setFont(self._mono)
-        self._raw_resp_text.setReadOnly(True)
-        resp_tabs.addTab(self._raw_resp_text, "文本")
+        self._tcp_resp_text = QPlainTextEdit()
+        self._tcp_resp_text.setFont(self._mono)
+        self._tcp_resp_text.setReadOnly(True)
+        resp_tabs.addTab(self._tcp_resp_text, "文本")
 
-        self._raw_resp_hex = QPlainTextEdit()
-        self._raw_resp_hex.setFont(self._mono)
-        self._raw_resp_hex.setReadOnly(True)
-        resp_tabs.addTab(self._raw_resp_hex, "Hex")
+        self._tcp_resp_hex = QPlainTextEdit()
+        self._tcp_resp_hex.setFont(self._mono)
+        self._tcp_resp_hex.setReadOnly(True)
+        resp_tabs.addTab(self._tcp_resp_hex, "Hex")
         layout.addWidget(resp_tabs, stretch=1)
 
-        self._raw_status = QLabel("就绪")
-        self._raw_status.setStyleSheet("color:#666;font-size:11px")
-        layout.addWidget(self._raw_status)
+        self._tcp_status = QLabel("就绪")
+        self._tcp_status.setStyleSheet("color:#666;font-size:11px")
+        layout.addWidget(self._tcp_status)
 
         return w
 
     # ══════════════════════════════════════════════════════════
-    #  辅助: 获取代理配置
+    #  Tab 3: Raw UDP 探测
     # ══════════════════════════════════════════════════════════
-    def _get_proxy(self):
-        if not self._proxy_enable.isChecked():
-            return None
-        proxy = {
-            'type': self._proxy_type.currentText(),
-            'host': self._proxy_host.text().strip(),
-            'port': self._proxy_port.value(),
-        }
-        user = self._proxy_user.text().strip()
-        pwd = self._proxy_pass.text().strip()
-        if user:
-            proxy['username'] = user
-            proxy['password'] = pwd
-        return proxy
+    def _build_raw_udp_tab(self):
+        w = QWidget()
+        layout = QVBoxLayout(w)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(6)
+
+        group = QGroupBox("Raw UDP 探测 — 发送 UDP 数据包并等待响应")
+        g = QVBoxLayout(group)
+
+        hint = QLabel(
+            "UDP 无连接，状态含义:  "
+            "open = 收到 UDP 响应；  "
+            "open|filtered = 超时（可能开放或防火墙过滤）；  "
+            "closed = 收到 ICMP 不可达")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color:#6b7a8d;font-size:11px;")
+        g.addWidget(hint)
+
+        r1 = QHBoxLayout()
+        r1.addWidget(QLabel("主机:"))
+        self._udp_host = QLineEdit("127.0.0.1")
+        self._udp_host.setFixedWidth(200)
+        r1.addWidget(self._udp_host)
+        r1.addWidget(QLabel("端口:"))
+        self._udp_port = QSpinBox()
+        self._udp_port.setRange(1, 65535)
+        self._udp_port.setValue(53)
+        self._udp_port.setFixedWidth(90)
+        r1.addWidget(self._udp_port)
+        r1.addWidget(QLabel("超时:"))
+        self._udp_timeout = QSpinBox()
+        self._udp_timeout.setRange(1, 60)
+        self._udp_timeout.setValue(5)
+        self._udp_timeout.setSuffix(" 秒")
+        self._udp_timeout.setFixedWidth(80)
+        r1.addWidget(self._udp_timeout)
+        r1.addStretch()
+        g.addLayout(r1)
+
+        g.addWidget(QLabel("发送数据（留空则发送空 UDP 包）:"))
+
+        r_fmt = QHBoxLayout()
+        self._udp_fmt = QComboBox()
+        self._udp_fmt.addItems(["UTF-8 文本", "Hex 字节", r"原始转义 (\r\n)"])
+        self._udp_fmt.setFixedWidth(160)
+        r_fmt.addWidget(self._udp_fmt)
+
+        udp_presets = QComboBox()
+        udp_presets.addItems(["快捷填充…", "DNS 查询 (A记录 example.com)",
+                               "NTP 版本请求", "空包（探测响应）"])
+        udp_presets.setFixedWidth(220)
+        udp_presets.currentIndexChanged.connect(self._udp_preset)
+        r_fmt.addWidget(udp_presets)
+        r_fmt.addStretch()
+        g.addLayout(r_fmt)
+
+        self._udp_send = QPlainTextEdit()
+        self._udp_send.setFont(self._mono)
+        self._udp_send.setPlaceholderText(
+            "示例 (Hex，DNS 查询): "
+            "00 01 01 00 00 01 00 00 00 00 00 00 07 65 78 61 6d 70 6c 65 03 63 6f 6d 00 00 01 00 01\n"
+            "留空: 发送空 UDP 包（适合探测是否有任何响应）")
+        self._udp_send.setMaximumHeight(90)
+        g.addWidget(self._udp_send)
+
+        r_btn = QHBoxLayout()
+        self._udp_btn = QPushButton("▶  发送 UDP 探测")
+        self._udp_btn.setFixedHeight(34)
+        self._udp_btn.setStyleSheet(_BTN_PRIMARY)
+        self._udp_btn.clicked.connect(self._udp_probe)
+        r_btn.addWidget(self._udp_btn)
+        r_btn.addStretch()
+        g.addLayout(r_btn)
+
+        layout.addWidget(group)
+
+        layout.addWidget(QLabel("响应数据:"))
+        resp_tabs = QTabWidget()
+        self._udp_resp_text = QPlainTextEdit()
+        self._udp_resp_text.setFont(self._mono)
+        self._udp_resp_text.setReadOnly(True)
+        resp_tabs.addTab(self._udp_resp_text, "文本")
+
+        self._udp_resp_hex = QPlainTextEdit()
+        self._udp_resp_hex.setFont(self._mono)
+        self._udp_resp_hex.setReadOnly(True)
+        resp_tabs.addTab(self._udp_resp_hex, "Hex")
+        layout.addWidget(resp_tabs, stretch=1)
+
+        self._udp_status = QLabel("就绪")
+        self._udp_status.setStyleSheet("color:#666;font-size:11px")
+        layout.addWidget(self._udp_status)
+
+        return w
 
     # ══════════════════════════════════════════════════════════
     #  服务预设
@@ -380,12 +566,79 @@ class PortScanPanel(QWidget):
             self._ports.setText(','.join(str(p) for p in ports))
 
     # ══════════════════════════════════════════════════════════
-    #  批量扫描逻辑
+    #  命令预览刷新
+    # ══════════════════════════════════════════════════════════
+    def _refresh_cmd_preview(self):
+        host  = self._host.text().strip() or '<host>'
+        ports = self._ports.text().strip() or '1-1000'
+        idx   = self._scan_type.currentIndex()
+        flags = SCAN_TYPE_FLAGS[idx] if idx < len(SCAN_TYPE_FLAGS) else ['-sT']
+        timing = self._timing.currentIndex()
+        try:
+            port_list = parse_ports(ports) if ports != '1-1000' else []
+        except Exception:
+            port_list = []
+        display_ports = ports if not port_list else ports
+        cmd = build_nmap_cmd(
+            host, display_ports, flags,
+            self._svc_detect.isChecked(),
+            self._os_detect.isChecked(),
+            self._script.isChecked(),
+            timing,
+        )
+        self._cmd_preview.setText(' '.join(cmd))
+
+    # ══════════════════════════════════════════════════════════
+    #  nmap 下载逻辑
+    # ══════════════════════════════════════════════════════════
+    def _start_download(self):
+        if self._download_thread and self._download_thread.isRunning():
+            return
+        self._dl_btn.setEnabled(False)
+        self._dl_progress.setRange(0, 100)
+        self._dl_progress.setValue(0)
+        self._dl_progress.setVisible(True)
+        self._nmap_banner_lbl.setText(
+            f"正在下载 nmap {NMAP_VERSION}，请稍候… (来源: {NMAP_ZIP_URL})")
+
+        self._download_thread = NmapDownloadThread()
+        self._download_thread.progress.connect(self._on_dl_progress)
+        self._download_thread.finished.connect(self._on_dl_finished)
+        self._download_thread.error.connect(self._on_dl_error)
+        self._download_thread.start()
+
+    def _on_dl_progress(self, downloaded, total):
+        if total > 0:
+            pct = int(downloaded * 100 / total)
+            self._dl_progress.setValue(pct)
+            mb_d = downloaded / 1_048_576
+            mb_t = total      / 1_048_576
+            self._nmap_banner_lbl.setText(
+                f"下载中… {mb_d:.1f} / {mb_t:.1f} MB")
+
+    def _on_dl_finished(self, exe_path):
+        self._dl_progress.setVisible(False)
+        self._nmap_banner.setVisible(False)
+        self._status.setText(
+            f"nmap {NMAP_VERSION} 下载完成！路径: {exe_path}")
+
+    def _on_dl_error(self, msg):
+        self._dl_btn.setEnabled(True)
+        self._dl_progress.setVisible(False)
+        self._nmap_banner_lbl.setText(f"下载失败: {msg}  — 点击重试")
+
+    # ══════════════════════════════════════════════════════════
+    #  nmap 扫描逻辑
     # ══════════════════════════════════════════════════════════
     def _start_scan(self):
         if self._scan_thread and self._scan_thread.isRunning():
             self._status.setText("扫描正在进行，请等待完成或点击停止")
             return
+
+        if not is_nmap_available():
+            self._status.setText("未找到 nmap，请先安装: https://nmap.org/download")
+            return
+
         host = self._host.text().strip()
         port_text = self._ports.text().strip()
         if not host:
@@ -405,152 +658,231 @@ class PortScanPanel(QWidget):
 
         self._table.setRowCount(0)
         self._table.setSortingEnabled(False)
-        self._open_count = 0
-        self._progress.setRange(0, len(ports))
-        self._progress.setValue(0)
         self._progress.setVisible(True)
         self._scan_btn.setEnabled(False)
         self._stop_btn.setEnabled(True)
-        self._result_label.setText("")
+        self._result_label.setText("扫描中…")
 
-        proxy = self._get_proxy()
-        via = ''
-        if proxy:
-            via = f" (via {proxy['type']} {proxy['host']}:{proxy['port']})"
+        idx   = self._scan_type.currentIndex()
+        flags = SCAN_TYPE_FLAGS[idx] if idx < len(SCAN_TYPE_FLAGS) else ['-sT']
+        timing = self._timing.currentIndex()
+
         self._status.setText(
-            f"正在扫描 {host} 的 {len(ports)} 个端口{via} ...")
+            f"正在扫描 {host} ({len(ports)} 个端口) — 请稍候…")
 
-        self._scan_thread = ScanThread(
-            host, ports, self._timeout.value(), proxy)
-        self._scan_thread.result_ready.connect(self._on_result)
-        self._scan_thread.progress.connect(self._on_progress)
-        self._scan_thread.finished_all.connect(self._on_finished)
-        self._scan_thread.error.connect(
-            lambda msg: self._status.setText(msg))
+        self._scan_thread = NmapScanThread(
+            host, ports, flags,
+            self._svc_detect.isChecked(),
+            self._os_detect.isChecked(),
+            self._script.isChecked(),
+            timing,
+            self._timeout.value(),
+        )
+        self._scan_thread.scan_done.connect(self._on_scan_done)
+        self._scan_thread.scan_error.connect(self._on_scan_error)
         self._scan_thread.start()
 
     def _stop_scan(self):
         if self._scan_thread and self._scan_thread.isRunning():
             self._scan_thread.stop()
-            self._status.setText("正在停止...")
+            self._status.setText("正在停止…")
 
-    def _on_result(self, r):
-        row = self._table.rowCount()
-        self._table.insertRow(row)
-
-        port_item = QTableWidgetItem()
-        port_item.setData(Qt.DisplayRole, r['port'])
-        port_item.setTextAlignment(Qt.AlignCenter)
-        self._table.setItem(row, 0, port_item)
-
-        if r['open']:
-            self._open_count += 1
-            status_item = QTableWidgetItem("开放")
-            status_item.setBackground(QColor('#ccffcc'))
-            status_item.setTextAlignment(Qt.AlignCenter)
-        else:
-            status_item = QTableWidgetItem("关闭")
-            status_item.setBackground(QColor('#ffcccc'))
-            status_item.setTextAlignment(Qt.AlignCenter)
-        self._table.setItem(row, 1, status_item)
-
-        self._table.setItem(row, 2, QTableWidgetItem(r['service']))
-
-        detail = r['detail'] or r['banner']
-        if detail:
-            detail = detail.replace('\n', ' | ').strip()
-            if len(detail) > 300:
-                detail = detail[:300] + '...'
-        self._table.setItem(row, 3, QTableWidgetItem(detail))
-
-        known = WELL_KNOWN_PORTS.get(r['port'], '')
-        self._table.setItem(row, 4, QTableWidgetItem(known))
-
-    def _on_progress(self, current, total):
-        self._progress.setValue(current)
-        self._result_label.setText(
-            f"进度 {current}/{total} | 开放 {self._open_count}")
-
-    def _on_finished(self):
+    def _on_scan_done(self, results, cmd_str):
         self._progress.setVisible(False)
         self._scan_btn.setEnabled(True)
         self._stop_btn.setEnabled(False)
+
+        # 填充表格
+        self._table.setRowCount(len(results))
+        open_cnt = 0
+        for row, r in enumerate(results):
+            port_item = QTableWidgetItem()
+            port_item.setData(Qt.DisplayRole, r['port'])
+            port_item.setTextAlignment(Qt.AlignCenter)
+            self._table.setItem(row, 0, port_item)
+
+            proto_item = QTableWidgetItem(r['protocol'])
+            proto_item.setTextAlignment(Qt.AlignCenter)
+            self._table.setItem(row, 1, proto_item)
+
+            state = r['state']
+            s_item = QTableWidgetItem(state)
+            s_item.setTextAlignment(Qt.AlignCenter)
+            if state == 'open':
+                open_cnt += 1
+                s_item.setBackground(QColor('#ccffcc'))
+            elif state == 'filtered':
+                s_item.setBackground(QColor('#ffffcc'))
+            elif state == 'closed':
+                s_item.setBackground(QColor('#ffcccc'))
+            self._table.setItem(row, 2, s_item)
+
+            self._table.setItem(row, 3, QTableWidgetItem(r['reason']))
+            self._table.setItem(row, 4, QTableWidgetItem(r['service']))
+            self._table.setItem(row, 5, QTableWidgetItem(r['version']))
+            known = WELL_KNOWN_PORTS.get(r['port'], '')
+            self._table.setItem(row, 6, QTableWidgetItem(known))
+
         self._table.setSortingEnabled(True)
-        total = self._table.rowCount()
         self._result_label.setText(
-            f"共 {total} 个端口 | 开放 {self._open_count}")
-        self._status.setText("扫描完成")
+            f"共 {len(results)} 个端口 | 开放 {open_cnt}")
+        self._status.setText(f"扫描完成  |  {cmd_str}")
+
+    def _on_scan_error(self, msg):
+        self._progress.setVisible(False)
+        self._scan_btn.setEnabled(True)
+        self._stop_btn.setEnabled(False)
+        self._status.setText(f"错误: {msg}")
+        self._result_label.setText("")
 
     # ══════════════════════════════════════════════════════════
-    #  Raw TCP 探测
+    #  Raw TCP 逻辑
     # ══════════════════════════════════════════════════════════
-    def _parse_send_data(self):
-        """根据选择的格式解析用户输入为 bytes"""
-        text = self._raw_send.toPlainText()
+    def _parse_tcp_data(self):
+        text = self._tcp_send.toPlainText()
         if not text.strip():
             return b''
-
-        fmt = self._raw_fmt.currentIndex()
-        if fmt == 0:  # UTF-8
+        fmt = self._tcp_fmt.currentIndex()
+        if fmt == 0:
             return text.encode('utf-8')
-        elif fmt == 1:  # Hex
+        elif fmt == 1:
             hex_str = text.replace(' ', '').replace('\n', '').replace('\r', '')
             return bytes.fromhex(hex_str)
-        else:  # 原始转义
+        else:
             return text.encode('utf-8').decode('unicode_escape').encode('latin-1')
 
-    def _raw_probe(self):
-        if self._raw_thread and self._raw_thread.isRunning():
-            self._raw_status.setText("探测正在进行，请稍候")
+    def _tcp_probe(self):
+        if self._raw_tcp_thread and self._raw_tcp_thread.isRunning():
+            self._tcp_status.setText("探测正在进行，请稍候")
             return
-        host = self._raw_host.text().strip()
-        port = self._raw_port.value()
+        host = self._tcp_host.text().strip()
+        port = self._tcp_port.value()
         if not host:
-            self._raw_status.setText("请输入主机地址")
+            self._tcp_status.setText("请输入主机地址")
             return
-
         try:
-            send_data = self._parse_send_data()
+            send_data = self._parse_tcp_data()
         except Exception as e:
-            self._raw_status.setText(f"数据格式错误: {e}")
+            self._tcp_status.setText(f"数据格式错误: {e}")
             return
 
-        proxy = None
-        if self._raw_proxy_enable.isChecked():
-            proxy = self._get_proxy()
+        self._tcp_status.setText(f"正在连接 {host}:{port} …")
+        self._tcp_resp_text.clear()
+        self._tcp_resp_hex.clear()
+        self._tcp_btn.setEnabled(False)
 
-        self._raw_status.setText(
-            f"正在连接 {host}:{port} ...")
-        self._raw_resp_text.clear()
-        self._raw_resp_hex.clear()
-        self._raw_btn.setEnabled(False)
+        self._raw_tcp_thread = RawTcpThread(
+            host, port, send_data, self._tcp_timeout.value())
+        self._raw_tcp_thread.finished.connect(self._on_tcp_result)
+        self._raw_tcp_thread.error.connect(self._on_tcp_error)
+        self._raw_tcp_thread.start()
 
-        self._raw_thread = RawProbeThread(
-            host, port, send_data,
-            self._raw_timeout.value(), proxy)
-        self._raw_thread.finished.connect(self._on_raw_result)
-        self._raw_thread.error.connect(self._on_raw_error)
-        self._raw_thread.start()
-
-    def _on_raw_result(self, r):
-        self._raw_btn.setEnabled(True)
+    def _on_tcp_result(self, r):
+        self._tcp_btn.setEnabled(True)
         if not r['connected']:
-            self._raw_resp_text.setPlainText(r['error'])
-            self._raw_status.setText("连接失败")
+            self._tcp_resp_text.setPlainText(r['error'])
+            self._tcp_status.setText("连接失败")
+            return
+        self._tcp_resp_text.setPlainText(r['recv_text'])
+        self._tcp_resp_hex.setPlainText(r['recv_hex'])
+        recv_len = len(r['recv_bytes'])
+        self._tcp_status.setText(
+            f"连接成功 | 发送 {r['sent']} 字节 | 接收 {recv_len} 字节"
+            + (f" | {r['error']}" if r['error'] else ''))
+
+    def _on_tcp_error(self, msg):
+        self._tcp_btn.setEnabled(True)
+        self._tcp_status.setText(f"错误: {msg}")
+
+    # ══════════════════════════════════════════════════════════
+    #  Raw UDP 逻辑
+    # ══════════════════════════════════════════════════════════
+    _UDP_PRESETS = {
+        1: ("16", "00 01 01 00 00 01 00 00 00 00 00 00 "
+                   "07 65 78 61 6d 70 6c 65 03 63 6f 6d 00 00 01 00 01"),  # DNS
+        2: ("53", "1b 00 00 00 00 00 00 00 00 00 00 00 "
+                   "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00"),  # NTP
+        3: ("",  ""),  # empty
+    }
+
+    def _udp_preset(self, idx):
+        if idx == 0:
+            return
+        if idx == 1:
+            self._udp_port.setValue(53)
+            self._udp_fmt.setCurrentIndex(1)  # Hex
+            self._udp_send.setPlainText(
+                "00 01 01 00 00 01 00 00 00 00 00 00 "
+                "07 65 78 61 6d 70 6c 65 03 63 6f 6d 00 00 01 00 01")
+        elif idx == 2:
+            self._udp_port.setValue(123)
+            self._udp_fmt.setCurrentIndex(1)  # Hex
+            self._udp_send.setPlainText(
+                "1b 00 00 00 00 00 00 00 00 00 00 00 "
+                "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00")
+        elif idx == 3:
+            self._udp_send.clear()
+
+    def _parse_udp_data(self):
+        text = self._udp_send.toPlainText()
+        if not text.strip():
+            return b''
+        fmt = self._udp_fmt.currentIndex()
+        if fmt == 0:
+            return text.encode('utf-8')
+        elif fmt == 1:
+            hex_str = text.replace(' ', '').replace('\n', '').replace('\r', '')
+            return bytes.fromhex(hex_str)
+        else:
+            return text.encode('utf-8').decode('unicode_escape').encode('latin-1')
+
+    def _udp_probe(self):
+        if self._raw_udp_thread and self._raw_udp_thread.isRunning():
+            self._udp_status.setText("探测正在进行，请稍候")
+            return
+        host = self._udp_host.text().strip()
+        port = self._udp_port.value()
+        if not host:
+            self._udp_status.setText("请输入主机地址")
+            return
+        try:
+            send_data = self._parse_udp_data()
+        except Exception as e:
+            self._udp_status.setText(f"数据格式错误: {e}")
             return
 
-        self._raw_resp_text.setPlainText(r['recv_text'])
-        self._raw_resp_hex.setPlainText(r['recv_hex'])
+        self._udp_status.setText(f"正在发送 UDP 包到 {host}:{port} …")
+        self._udp_resp_text.clear()
+        self._udp_resp_hex.clear()
+        self._udp_btn.setEnabled(False)
 
-        recv_len = len(r['recv_bytes'])
-        self._raw_status.setText(
-            f"连接成功 | 发送 {r['sent']} 字节 | "
-            f"接收 {recv_len} 字节"
-            + (f" | 错误: {r['error']}" if r['error'] else ''))
+        self._raw_udp_thread = RawUdpThread(
+            host, port, send_data, self._udp_timeout.value())
+        self._raw_udp_thread.finished.connect(self._on_udp_result)
+        self._raw_udp_thread.error.connect(self._on_udp_error)
+        self._raw_udp_thread.start()
 
-    def _on_raw_error(self, msg):
-        self._raw_btn.setEnabled(True)
-        self._raw_status.setText(f"错误: {msg}")
+    def _on_udp_result(self, r):
+        self._udp_btn.setEnabled(True)
+        state = r['state']
+        if state == 'open':
+            self._udp_resp_text.setPlainText(r['recv_text'])
+            self._udp_resp_hex.setPlainText(r['recv_hex'])
+            self._udp_status.setText(
+                f"状态: open | 发送 {r['sent']} 字节 | 接收 {len(r['recv_bytes'])} 字节")
+        elif state == 'open|filtered':
+            self._udp_resp_text.setPlainText("（无响应）")
+            self._udp_status.setText(f"状态: open|filtered — {r['error']}")
+        elif state == 'closed':
+            self._udp_resp_text.setPlainText("（端口已关闭）")
+            self._udp_status.setText(f"状态: closed — {r['error']}")
+        else:
+            self._udp_resp_text.setPlainText(r['error'])
+            self._udp_status.setText(f"状态: error — {r['error']}")
+
+    def _on_udp_error(self, msg):
+        self._udp_btn.setEnabled(True)
+        self._udp_status.setText(f"错误: {msg}")
 
     # ══════════════════════════════════════════════════════════
     #  工具
@@ -564,13 +896,13 @@ class PortScanPanel(QWidget):
         rows = self._table.rowCount()
         if rows == 0:
             return
-        lines = [f"{'端口':<8}{'状态':<8}{'服务':<25}{'详情'}"]
-        lines.append('-' * 80)
+        headers = ["端口", "协议", "状态", "原因", "服务", "版本", "知名服务"]
+        lines = ['\t'.join(headers)]
         for i in range(rows):
-            port = self._table.item(i, 0).text() if self._table.item(i, 0) else ''
-            status = self._table.item(i, 1).text() if self._table.item(i, 1) else ''
-            service = self._table.item(i, 2).text() if self._table.item(i, 2) else ''
-            detail = self._table.item(i, 3).text() if self._table.item(i, 3) else ''
-            lines.append(f"{port:<8}{status:<8}{service:<25}{detail}")
+            cells = []
+            for c in range(self._table.columnCount()):
+                item = self._table.item(i, c)
+                cells.append(item.text() if item else '')
+            lines.append('\t'.join(cells))
         QApplication.clipboard().setText('\n'.join(lines))
         self._status.setText("已复制到剪贴板")

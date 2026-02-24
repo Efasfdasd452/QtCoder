@@ -32,6 +32,26 @@ else:
     print(f"[WARN] FFmpeg 目录不存在: {_ffmpeg_src}")
     print(f"[WARN] 打包后将不包含 FFmpeg，视频功能不可用")
 
+# 收集 nmap → 打包后放在 bin/nmap/ 目录下（与 nmap_finder.py 中路径对应）
+_nmap_src_dir = os.path.join(PROJECT_DIR, 'bin', 'nmap')
+# 全部 nmap 文件统一放 datas，绝对不能放 binaries：
+#   upx=True 会对 binaries 里的 .exe/.dll 做 UPX 压缩，
+#   会破坏 nmap.exe 的 Npcap 驱动签名校验，导致打包后无法运行。
+#   datas 按原样复制，不做任何处理，nmap.exe 可正常执行。
+_nmap_datas = []
+if os.path.isdir(_nmap_src_dir):
+    for _root, _dirs, _files in os.walk(_nmap_src_dir):
+        for _fname in _files:
+            _src  = os.path.join(_root, _fname)
+            _rel  = os.path.relpath(_root, _nmap_src_dir)
+            _dest = ('bin/nmap' if _rel == '.'
+                     else f"bin/nmap/{_rel}".replace('\\', '/'))
+            _nmap_datas.append((_src, _dest))
+    print(f"[INFO] nmap: {len(_nmap_datas)} 个文件（全部放 datas，保持原样）")
+else:
+    print(f"[WARN] nmap 目录不存在: {_nmap_src_dir}")
+    print(f"[WARN] 打包后将不包含 nmap，端口扫描功能不可用")
+
 # ── Hidden Imports ────────────────────────────────────────────
 # PyInstaller 无法自动检测的模块
 hidden_imports = [
@@ -134,6 +154,7 @@ hidden_imports = [
     'core.string_diff',
     'core.zh_convert',
     'core.mojibake_fixer',
+    'core.nmap_finder',
     'core.port_scanner',
     'core.proxy_tester',
     'core.html_tools',
@@ -177,6 +198,77 @@ hidden_imports = [
     'ui.panels.firewall_panel',
     'ui.panels.video_panel',
     'ui.panels.image_panel',
+    'ui.panels.b64image_panel',
+    'ui.panels.stroke_panel',
+    'ui.panels.line_big_panel',
+    'ui.panels.torrent_magnet_panel',
+    'ui.panels.selfcert_panel',
+    'ui.panels.json_python_panel',
+    'ui.panels.json_cpp_panel',
+    'ui.panels.json_java_panel',
+    'ui.panels.json_js_panel',
+    'ui.panels.json_php_panel',
+    'ui.panels.timezone_panel',
+    'ui.panels.filehash_panel',
+    'ui.panels.url_parser_panel',
+    'ui.panels.jwt_panel',
+    'ui.panels.cookie_panel',
+    'ui.panels.config_convert_panel',
+
+    # ── 时区 (zoneinfo + tzdata) ────────────────────────────
+    'zoneinfo',
+    'zoneinfo._common',
+    'zoneinfo._czoneinfo',
+    'tzdata',
+    'tzdata.zoneinfo',
+    'core.timezone_tool',
+
+    # ── 新功能模块 ──────────────────────────────────────────
+    'core.file_hash',
+    'core.url_parser',
+    'core.jwt_tool',
+    'core.cookie_parser',
+    'core.config_convert',
+
+    # ── pyyaml (配置转换) ────────────────────────────────────
+    'yaml',
+    'yaml.reader',
+    'yaml.scanner',
+    'yaml.parser',
+    'yaml.composer',
+    'yaml.constructor',
+    'yaml.resolver',
+    'yaml.representer',
+    'yaml.emitter',
+    'yaml.serializer',
+    'yaml.dumper',
+
+    # ── toml (配置转换) ──────────────────────────────────────
+    'toml',
+    'toml.encoder',
+    'toml.decoder',
+
+    # ── pgpy (PGP 签名验证) ──────────────────────────────────
+    'pgpy',
+    'pgpy.pgp',
+    'pgpy.types',
+    'pgpy.constants',
+    'pgpy.errors',
+    'pgpy.packet',
+    'pgpy.packet.packets',
+    'pgpy.packet.fields',
+    'pgpy.decorators',
+    'pgpy.symenc',
+    'core.pgp_verify',
+    # pgpy 依赖 pyasn1
+    'pyasn1',
+    'pyasn1.type',
+    'pyasn1.type.univ',
+    'pyasn1.type.namedtype',
+    'pyasn1.codec',
+    'pyasn1.codec.ber',
+    'pyasn1.codec.ber.decoder',
+    'pyasn1.codec.ber.encoder',
 
     # ── 图片压缩 (Pillow) ───────────────────────────────────
     'PIL',
@@ -237,6 +329,16 @@ try:
 except ImportError:
     pass
 
+# tzdata: Windows 下 zoneinfo 需要此包提供时区数据库
+# 使用 collect_data_files 将所有时区数据文件打包进去
+try:
+    from PyInstaller.utils.hooks import collect_data_files as _cdf
+    datas += _cdf('tzdata')
+    print("[INFO] tzdata 数据文件已收集")
+except Exception as _e:
+    print(f"[WARN] 无法收集 tzdata 数据: {_e}")
+    print("[WARN] 打包后时区功能可能不可用，请运行: pip install tzdata")
+
 # ── 排除不需要的模块（减小体积）────────────────────────────
 excludes = [
     'tkinter', '_tkinter',
@@ -253,8 +355,8 @@ excludes = [
 a = Analysis(
     ['main.py'],
     pathex=[PROJECT_DIR],
-    binaries=_ffmpeg_binaries,
-    datas=datas,
+    binaries=_ffmpeg_binaries,          # nmap 放 datas，避免 UPX 破坏
+    datas=datas + _nmap_datas,
     hiddenimports=hidden_imports,
     hookspath=[],
     hooksconfig={},

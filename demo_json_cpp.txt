@@ -1,0 +1,40 @@
+{
+    "site": "json",
+    "name": "tomi",
+    "age": 28,
+    "city": "suzhou",
+    "site_name": "json.cn网站",
+    "list": [1, 2, 3, 4, 5],
+    "dict": {
+        "a1": "123",
+        "b2": 789,
+        "c3": "你好，程序员的【世界】"
+    }
+}
+
+转换以后：
+
+class MyClass {
+public:
+    std::string site;
+    std::string name;
+    int age;
+    std::string city;
+    std::string site_name;
+    std::vector<int> list;
+    Dict dict;
+
+    MyClass() = default;
+    ~MyClass() = default;
+};
+
+
+class Dict {
+public:
+    std::string a1;
+    int b2;
+    std::string c3;
+
+    Dict() = default;
+    ~Dict() = default;
+};

@@ -12,6 +12,11 @@ import socket
 import struct
 import ssl
 import base64
+import subprocess
+import shutil
+import xml.etree.ElementTree as ET
+
+from core.nmap_finder import get_nmap_exe, is_nmap_available   # noqa: F401  (re-export)
 
 # ══════════════════════════════════════════════════════════════
 #  知名端口 / 服务 预设
@@ -588,3 +593,167 @@ def _extract_header(http_text, header_name):
         if line.lower().startswith(header_name.lower() + ':'):
             return line.split(':', 1)[1].strip()
     return ''
+
+
+# ══════════════════════════════════════════════════════════════
+#  nmap 集成
+# ══════════════════════════════════════════════════════════════
+
+# 扫描类型预设（label → nmap flags list）
+SCAN_TYPE_NAMES = [
+    "TCP Connect  (-sT)",
+    "SYN 隐身    (-sS)  [需 root/Npcap]",
+    "UDP 扫描    (-sU)  [需 root/Npcap]",
+    "TCP+UDP  (-sS -sU)  [需 root/Npcap]",
+    "ACK 扫描   (-sA)",
+]
+SCAN_TYPE_FLAGS = [
+    ["-sT"],
+    ["-sS"],
+    ["-sU"],
+    ["-sS", "-sU"],
+    ["-sA"],
+]
+
+TIMING_NAMES = [
+    "-T0  偏执（最慢）",
+    "-T1  鬼祟",
+    "-T2  礼貌",
+    "-T3  普通",
+    "-T4  积极（推荐）",
+    "-T5  疯狂（最快）",
+]
+
+
+def build_nmap_cmd(host, ports, scan_flags=None, service_detect=False,
+                   os_detect=False, script=False, timing=4, extra_args=None):
+    """构建 nmap 命令列表（自动使用项目内 bin/nmap/nmap.exe 或系统 nmap）。
+
+    scan_flags: list，如 ['-sT'] 或 ['-sS', '-sU']
+    ports:      int 列表或端口字符串
+    """
+    nmap_exe = get_nmap_exe() or 'nmap'
+    if scan_flags is None:
+        scan_flags = ['-sT']
+    if isinstance(ports, (list, tuple)):
+        port_str = ','.join(str(p) for p in ports)
+    else:
+        port_str = str(ports)
+    cmd = [nmap_exe] + scan_flags + ['-p', port_str, '-oX', '-']
+    if service_detect:
+        cmd.append('-sV')
+    if os_detect:
+        cmd.append('-O')
+    if script:
+        cmd.append('-sC')
+    cmd.append(f'-T{timing}')
+    if extra_args:
+        cmd.extend(extra_args)
+    cmd.append(host)
+    return cmd
+
+
+def parse_nmap_xml(xml_output):
+    """解析 nmap -oX 输出，返回端口结果列表。
+
+    每条结果字典:
+        port, protocol, state, reason, service, version, open
+    """
+    results = []
+    try:
+        root = ET.fromstring(xml_output)
+    except ET.ParseError:
+        return results
+    for host_elem in root.findall('host'):
+        ports_elem = host_elem.find('ports')
+        if ports_elem is None:
+            continue
+        for port_elem in ports_elem.findall('port'):
+            protocol = port_elem.get('protocol', 'tcp')
+            portid   = int(port_elem.get('portid', 0))
+            state_elem = port_elem.find('state')
+            if state_elem is not None:
+                state  = state_elem.get('state', 'unknown')
+                reason = state_elem.get('reason', '')
+            else:
+                state, reason = 'unknown', ''
+            service_elem = port_elem.find('service')
+            service = version = ''
+            if service_elem is not None:
+                service = service_elem.get('name', '')
+                parts   = [
+                    service_elem.get('product', ''),
+                    service_elem.get('version', ''),
+                    service_elem.get('extrainfo', ''),
+                ]
+                version = ' '.join(p for p in parts if p).strip()
+            results.append({
+                'port':     portid,
+                'protocol': protocol,
+                'state':    state,
+                'reason':   reason,
+                'service':  service,
+                'version':  version,
+                'open':     state == 'open',
+            })
+    return results
+
+
+# ══════════════════════════════════════════════════════════════
+#  Raw UDP 探测
+# ══════════════════════════════════════════════════════════════
+
+def raw_udp_probe(host, port, send_data=b'', timeout=5.0):
+    """手动 UDP 探测: 发送数据 → 等待响应。
+
+    state 含义:
+        'open'         — 收到 UDP 响应（端口确实开放）
+        'open|filtered'— 超时（无响应，防火墙可能过滤）
+        'closed'       — 收到 ICMP 端口不可达
+        'error'        — 其他错误
+
+    返回 dict: sent, recv_bytes, recv_hex, recv_text, state, error
+    """
+    import errno as _errno
+    result = {
+        'sent':       0,
+        'recv_bytes': b'',
+        'recv_hex':   '',
+        'recv_text':  '',
+        'state':      'open|filtered',
+        'error':      '',
+    }
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(timeout)
+        sock.sendto(send_data, (host, port))
+        result['sent'] = len(send_data)
+        try:
+            data, _addr = sock.recvfrom(65535)
+            result['recv_bytes'] = data
+            result['recv_hex']   = data.hex(' ') if data else ''
+            result['recv_text']  = _safe_decode(data) if data else '（无响应数据）'
+            result['state']      = 'open'
+        except socket.timeout:
+            result['state'] = 'open|filtered'
+            result['error'] = '超时，端口可能开放或被防火墙过滤'
+        except ConnectionResetError:
+            # Windows: ICMP Port Unreachable → WinSock raises ConnectionResetError
+            result['state'] = 'closed'
+            result['error'] = '收到 ICMP 端口不可达（端口已关闭）'
+        except OSError as e:
+            if e.errno == _errno.ECONNREFUSED:
+                result['state'] = 'closed'
+                result['error'] = '端口已关闭（ICMP 不可达）'
+            else:
+                result['state'] = 'error'
+                result['error'] = str(e)
+    except Exception as e:
+        result['state'] = 'error'
+        result['error'] = str(e)
+    finally:
+        try:
+            sock.close()
+        except Exception:
+            pass
+    return result

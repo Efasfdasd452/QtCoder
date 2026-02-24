@@ -1,0 +1,9 @@
+转换前
+private String out_trade_no;
+private String auth_code;
+private double total_amount;
+
+转换后
+private String outTradeNo;
+private String authCode;
+private double totalAmount;
