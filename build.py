@@ -187,6 +187,32 @@ def copy_ffmpeg(target: str):
     return True
 
 
+def copy_nmap():
+    """将 bin/nmap/ 复制到 dist/QtCoder/bin/nmap/。
+
+    若不存在则跳过并提示：端口扫描功能不可用。
+    """
+    src = os.path.join(PROJECT_DIR, "bin", "nmap")
+    dst = os.path.join(DIST_DIR, APP_NAME, "bin", "nmap")
+
+    if not os.path.isdir(src):
+        log_warn("未找到 bin/nmap/，发行包中不包含 nmap，端口扫描功能不可用")
+        return False
+
+    if os.path.isdir(dst):
+        shutil.rmtree(dst)
+    shutil.copytree(src, dst)
+    total_size = 0
+    file_count = 0
+    for _root, _dirs, _files in os.walk(dst):
+        for _f in _files:
+            file_count += 1
+            total_size += os.path.getsize(os.path.join(_root, _f))
+    log_ok(f"nmap (bin/nmap/) 已复制到 dist/{APP_NAME}/bin/nmap/ "
+           f"({file_count} 个文件, {total_size / (1024*1024):.1f} MB)")
+    return True
+
+
 def copy_calibre():
     """将 bin/calibre（Calibre 便携版安装包或已解压目录）复制到 dist/QtCoder/bin/calibre/。
 
@@ -377,6 +403,9 @@ def main():
     log(f"复制 FFmpeg [{target}] 到发行目录 ...")
     copy_ffmpeg(target)
 
+    log("复制 nmap（若存在）到发行目录 ...")
+    has_nmap = copy_nmap()
+
     log("复制 Calibre（若存在）到发行目录 ...")
     has_calibre = copy_calibre()
 
@@ -385,6 +414,7 @@ def main():
     bin_name = f"{APP_NAME}.exe" if is_win_build else APP_NAME
     ffmpeg_dst = os.path.join(DIST_DIR, APP_NAME, "ffmpeg")
     ffmpeg_files = sorted(os.listdir(ffmpeg_dst)) if os.path.isdir(ffmpeg_dst) else []
+    nmap_dst = os.path.join(DIST_DIR, APP_NAME, "bin", "nmap")
     calibre_dst = os.path.join(DIST_DIR, APP_NAME, "bin", "calibre")
 
     print()
@@ -400,6 +430,10 @@ def main():
     for i, f in enumerate(ffmpeg_files):
         prefix = "│   ├──" if i < len(ffmpeg_files) - 1 else "│   └──"
         print(f"       {prefix} {f}")
+    if has_nmap and os.path.isdir(nmap_dst):
+        print(f"       ├── bin/nmap/  (端口扫描)")
+    else:
+        print(f"       ├── (nmap 未包含，端口扫描功能不可用)")
     if has_calibre and os.path.isdir(calibre_dst):
         print(f"       └── bin/calibre/  (Calibre 安装包或已解压，路径过长时请在软件内指定短路径下的 ebook-convert.exe)")
     else:
