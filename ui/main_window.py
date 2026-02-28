@@ -56,6 +56,8 @@ from .panels.url_parser_panel      import UrlParserPanel
 from .panels.jwt_panel             import JwtPanel
 from .panels.cookie_panel          import CookiePanel
 from .panels.config_convert_panel  import ConfigConvertPanel
+from .panels.doc_pdf_panel         import DocPdfPanel
+from .panels.ebook_convert_panel   import EbookConvertPanel
 
 # ── 功能注册表 ───────────────────────────────────────────────
 # (分类名, 分类色, [(显示名, 简介, Panel类), ...])
@@ -85,6 +87,8 @@ FEATURES = [
         ("URL 解析",      "解析复杂 URL 查询参数，可编辑，一键生成 Python requests 代码", UrlParserPanel),
         ("配置格式转换",  "JSON / YAML / TOML 三种配置文件格式双向互转", ConfigConvertPanel),
         ("文件哈希",      "拖放文件/文件夹批量计算 MD5/SHA-1/SHA-256/SHA-512，支持哈希验证", FileHashPanel),
+        ("Doc → PDF",    "批量将 .doc / .docx 文档导出为 PDF，可自定义输出目录",          DocPdfPanel),
+        ("电子书转换",   "EPUB / PDF / MOBI 批量互转，需安装 Calibre",                  EbookConvertPanel),
         ("cURL 转换",     "cURL 命令转换为 Python / Go / Java 等代码", CurlPanel),
         ("JSON 转 C++",   "将 JSON 结构转换为 C++ 类定义（含嵌套类）", JsonCppPanel),
         ("JSON 转 Java",  "将 JSON 结构转换为 Java 类定义（含 List、嵌套类）", JsonJavaPanel),
