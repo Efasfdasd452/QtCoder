@@ -187,6 +187,38 @@ def copy_ffmpeg(target: str):
     return True
 
 
+def copy_calibre():
+    """将 bin/calibre（Calibre 便携版安装包或已解压目录）复制到 dist/QtCoder/bin/calibre/。
+
+    若项目根下存在 bin/calibre/，则整目录复制到发行包，便于用户从安装包内解压到短路径后指定。
+    若不存在则跳过并提示：Calibre 需用户自行下载并解压到路径少于 59 字符的目录后，在软件内指定 ebook-convert.exe。
+    """
+    src = os.path.join(PROJECT_DIR, "bin", "calibre")
+    dst = os.path.join(DIST_DIR, APP_NAME, "bin", "calibre")
+
+    if not os.path.isdir(src):
+        log_warn("未找到 bin/calibre/，发行包中不包含 Calibre")
+        log("  用户需自行从 https://calibre-ebook.com/download 下载便携版，")
+        log("  解压到路径少于 59 字符的目录（如 C:\\ec\\calibre），")
+        log("  在「电子书转换」面板中点击「浏览」指定 ebook-convert.exe。")
+        return False
+
+    if os.path.isdir(dst):
+        shutil.rmtree(dst)
+    shutil.copytree(src, dst)
+    # 统计大小（仅顶层，避免过深遍历）
+    total_size = 0
+    file_count = 0
+    for _root, _dirs, _files in os.walk(dst):
+        for _f in _files:
+            file_count += 1
+            total_size += os.path.getsize(os.path.join(_root, _f))
+    log_ok(f"Calibre (bin/calibre/) 已复制到 dist/{APP_NAME}/bin/calibre/ "
+           f"({file_count} 个文件, {total_size / (1024*1024):.0f} MB)")
+    log("  提示：若路径过长导致转换失败，请将 bin/calibre 内内容解压到短路径（如 C:\\ec\\calibre）后在软件中指定路径。")
+    return True
+
+
 # ── 清理 ─────────────────────────────────────────────────────
 
 def clean():
@@ -345,11 +377,15 @@ def main():
     log(f"复制 FFmpeg [{target}] 到发行目录 ...")
     copy_ffmpeg(target)
 
+    log("复制 Calibre（若存在）到发行目录 ...")
+    has_calibre = copy_calibre()
+
     # ── 汇总
     is_win_build = target.startswith("win")
     bin_name = f"{APP_NAME}.exe" if is_win_build else APP_NAME
     ffmpeg_dst = os.path.join(DIST_DIR, APP_NAME, "ffmpeg")
     ffmpeg_files = sorted(os.listdir(ffmpeg_dst)) if os.path.isdir(ffmpeg_dst) else []
+    calibre_dst = os.path.join(DIST_DIR, APP_NAME, "bin", "calibre")
 
     print()
     print("-" * 60)
@@ -360,10 +396,14 @@ def main():
     else:
         print(f"       ├── ({bin_name} — 需在目标平台编译)")
     print(f"       ├── ... (依赖库)")
-    print(f"       └── ffmpeg/")
+    print(f"       ├── ffmpeg/")
     for i, f in enumerate(ffmpeg_files):
-        prefix = "└──" if i == len(ffmpeg_files) - 1 else "├──"
-        print(f"           {prefix} {f}")
+        prefix = "│   ├──" if i < len(ffmpeg_files) - 1 else "│   └──"
+        print(f"       {prefix} {f}")
+    if has_calibre and os.path.isdir(calibre_dst):
+        print(f"       └── bin/calibre/  (Calibre 安装包或已解压，路径过长时请在软件内指定短路径下的 ebook-convert.exe)")
+    else:
+        print(f"       └── (Calibre 未包含，需用户自行下载并解压到短路径后指定)")
     print()
     print("=" * 60)
     print("  Done!")

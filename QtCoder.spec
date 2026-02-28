@@ -214,6 +214,12 @@ hidden_imports = [
     'ui.panels.jwt_panel',
     'ui.panels.cookie_panel',
     'ui.panels.config_convert_panel',
+    'ui.panels.doc_pdf_panel',
+    'ui.panels.ebook_convert_panel',
+
+    # ── 电子书 / 文档转换 ───────────────────────────────────
+    'core.doc_to_pdf',
+    'core.ebook_convert',
 
     # ── 时区 (zoneinfo + tzdata) ────────────────────────────
     'zoneinfo',
